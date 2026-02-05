@@ -209,6 +209,7 @@ def gateway(
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         cron_service=cron,
+        google_config=config.tools.google,
     )
     
     # Set cron callback (needs agent)
@@ -316,6 +317,7 @@ def agent(
         workspace=config.workspace_path,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
+        google_config=config.tools.google,
     )
     
     if message:
@@ -343,6 +345,91 @@ def agent(
                     break
         
         asyncio.run(run_interactive())
+
+
+# ============================================================================
+# Auth Commands
+# ============================================================================
+
+auth_app = typer.Typer(help="Manage authentication for external services")
+app.add_typer(auth_app, name="auth")
+
+
+@auth_app.command("google")
+def auth_google(
+    port: int = typer.Option(8099, "--port", "-p", help="Local port for OAuth2 redirect"),
+    headless: bool = typer.Option(False, "--headless", help="Use manual copy-paste flow (for SSH / no browser)"),
+):
+    """Authenticate with Google (Gmail, Calendar).
+
+    Opens a browser for the OAuth2 consent flow. On headless servers (SSH, no
+    desktop), use --headless to get a URL you can open on another machine.
+
+    Requires google.clientId and google.clientSecret in ~/.nanobot/config.json
+    (under tools.google).
+    """
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    gcfg = config.tools.google
+
+    if not gcfg.client_id or not gcfg.client_secret:
+        console.print("[red]Error: Google client_id and client_secret are not configured.[/red]")
+        console.print(
+            "\nAdd them to [cyan]~/.nanobot/config.json[/cyan] under "
+            "[cyan]tools.google[/cyan]:\n"
+        )
+        console.print('  "tools": {')
+        console.print('    "google": {')
+        console.print('      "enabled": true,')
+        console.print('      "clientId": "YOUR_CLIENT_ID",')
+        console.print('      "clientSecret": "YOUR_CLIENT_SECRET"')
+        console.print("    }")
+        console.print("  }")
+        console.print(
+            "\nGet credentials at: "
+            "[cyan]https://console.cloud.google.com/apis/credentials[/cyan]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        from nanobot.auth.google import run_oauth_flow, has_valid_credentials
+    except ImportError:
+        console.print(
+            "[red]Google auth dependencies not installed.[/red]\n"
+            "Install with: [cyan]pip install nanobot-ai[google][/cyan]"
+        )
+        raise typer.Exit(1)
+
+    # Check if already authenticated
+    if has_valid_credentials(gcfg.client_id, gcfg.client_secret, gcfg.scopes):
+        console.print("[green]✓[/green] Already authenticated with Google.")
+        if not typer.confirm("Re-authenticate?"):
+            raise typer.Exit()
+
+    if headless:
+        console.print(f"{__logo__} Starting Google OAuth2 flow (headless mode)...")
+    else:
+        console.print(f"{__logo__} Starting Google OAuth2 flow...")
+        console.print("A browser window will open — or fall back to manual mode if unavailable.\n")
+
+    try:
+        creds = run_oauth_flow(
+            client_id=gcfg.client_id,
+            client_secret=gcfg.client_secret,
+            scopes=gcfg.scopes,
+            port=port,
+            headless=headless,
+        )
+        console.print(f"\n[green]✓[/green] Google authentication successful!")
+        console.print(f"  Tokens saved to [cyan]~/.nanobot/google_tokens.json[/cyan]")
+        console.print(
+            f"\nMake sure [cyan]tools.google.enabled[/cyan] is [cyan]true[/cyan] "
+            "in your config, then restart the gateway."
+        )
+    except Exception as e:
+        console.print(f"\n[red]Authentication failed: {e}[/red]")
+        raise typer.Exit(1)
 
 
 # ============================================================================
@@ -654,6 +741,22 @@ def status():
         console.print(f"Gemini API: {'[green]✓[/green]' if has_gemini else '[dim]not set[/dim]'}")
         vllm_status = f"[green]✓ {config.providers.vllm.api_base}[/green]" if has_vllm else "[dim]not set[/dim]"
         console.print(f"vLLM/Local: {vllm_status}")
+
+        # Google status
+        gcfg = config.tools.google
+        if gcfg.enabled:
+            google_authed = False
+            try:
+                from nanobot.auth.google import has_valid_credentials
+                google_authed = has_valid_credentials(
+                    gcfg.client_id, gcfg.client_secret, gcfg.scopes
+                )
+            except ImportError:
+                pass
+            status_str = "[green]✓ authenticated[/green]" if google_authed else "[yellow]not authenticated (run: nanobot auth google)[/yellow]"
+            console.print(f"Google: {status_str}")
+        else:
+            console.print(f"Google: [dim]disabled[/dim]")
 
 
 if __name__ == "__main__":
