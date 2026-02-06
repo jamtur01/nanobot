@@ -143,18 +143,23 @@ class Config(BaseSettings):
         return Path(self.agents.defaults.workspace).expanduser()
     
     def get_api_key(self) -> str | None:
-        """Get API key in priority order: OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM."""
-        return (
-            self.providers.openrouter.api_key or
-            self.providers.deepseek.api_key or
-            self.providers.anthropic.api_key or
-            self.providers.openai.api_key or
-            self.providers.gemini.api_key or
-            self.providers.zhipu.api_key or
-            self.providers.groq.api_key or
-            self.providers.vllm.api_key or
-            None
-        )
+        """Get API key in priority order: OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM.
+
+        Empty strings (default) are treated as unset so the chain falls through.
+        """
+        for provider in (
+            self.providers.openrouter,
+            self.providers.deepseek,
+            self.providers.anthropic,
+            self.providers.openai,
+            self.providers.gemini,
+            self.providers.zhipu,
+            self.providers.groq,
+            self.providers.vllm,
+        ):
+            if provider.api_key and provider.api_key.strip():
+                return provider.api_key.strip()
+        return None
     
     def get_api_base(self) -> str | None:
         """Get API base URL if using OpenRouter, Zhipu or vLLM."""

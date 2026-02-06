@@ -17,6 +17,35 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 
 
+def build_base_tools(
+    workspace: Path,
+    exec_config: Any,
+    brave_api_key: str | None = None,
+) -> ToolRegistry:
+    """Build the baseline set of tools shared by the main agent and subagents.
+
+    Message, Spawn, and Cron tools are intentionally *not* included here
+    because subagents should not have access to them.
+    """
+    from nanobot.config.schema import ExecToolConfig
+
+    exec_config = exec_config or ExecToolConfig()
+    allowed_roots = [workspace, Path.home() / ".nanobot"]
+
+    tools = ToolRegistry()
+    tools.register(ReadFileTool(allowed_roots=allowed_roots))
+    tools.register(WriteFileTool(allowed_roots=allowed_roots))
+    tools.register(ListDirTool(allowed_roots=allowed_roots))
+    tools.register(ExecTool(
+        working_dir=str(workspace),
+        timeout=exec_config.timeout,
+        restrict_to_workspace=exec_config.restrict_to_workspace,
+    ))
+    tools.register(WebSearchTool(api_key=brave_api_key))
+    tools.register(WebFetchTool())
+    return tools
+
+
 class SubagentManager:
     """
     Manages background subagent execution.
@@ -95,17 +124,11 @@ class SubagentManager:
         
         try:
             # Build subagent tools (no message tool, no spawn tool)
-            tools = ToolRegistry()
-            tools.register(ReadFileTool())
-            tools.register(WriteFileTool())
-            tools.register(ListDirTool())
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.exec_config.restrict_to_workspace,
-            ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
-            tools.register(WebFetchTool())
+            tools = build_base_tools(
+                workspace=self.workspace,
+                exec_config=self.exec_config,
+                brave_api_key=self.brave_api_key,
+            )
             
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task)

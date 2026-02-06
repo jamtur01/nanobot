@@ -1,7 +1,9 @@
 """Google Calendar tool for listing, creating, and managing calendar events."""
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Any
 
 from loguru import logger
@@ -103,21 +105,25 @@ class GoogleCalendarTool(Tool):
         return self._service
 
     async def execute(self, action: str, **kwargs: Any) -> str:
+        """Dispatch to synchronous Calendar helpers via a thread executor."""
         try:
+            loop = asyncio.get_running_loop()
             cal_id = kwargs.get("calendar_id", "primary") or "primary"
             if action == "list_events":
-                return self._list_events(cal_id, kwargs)
+                fn = partial(self._list_events, cal_id, kwargs)
             elif action == "get_event":
-                return self._get_event(cal_id, kwargs.get("event_id", ""))
+                fn = partial(self._get_event, cal_id, kwargs.get("event_id", ""))
             elif action == "create_event":
-                return self._create_event(cal_id, kwargs)
+                fn = partial(self._create_event, cal_id, kwargs)
             elif action == "update_event":
-                return self._update_event(cal_id, kwargs)
+                fn = partial(self._update_event, cal_id, kwargs)
             elif action == "delete_event":
-                return self._delete_event(cal_id, kwargs.get("event_id", ""))
+                fn = partial(self._delete_event, cal_id, kwargs.get("event_id", ""))
             elif action == "list_calendars":
-                return self._list_calendars()
-            return f"Unknown action: {action}"
+                fn = self._list_calendars
+            else:
+                return f"Unknown action: {action}"
+            return await loop.run_in_executor(None, fn)
         except Exception as e:
             logger.error(f"GoogleCalendarTool error: {e}")
             return f"Error: {e}"

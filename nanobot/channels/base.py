@@ -1,10 +1,14 @@
 """Base channel interface for chat platforms."""
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+
+# Shared media download directory
+_MEDIA_DIR = Path.home() / ".nanobot" / "media"
 
 
 class BaseChannel(ABC):
@@ -115,6 +119,31 @@ class BaseChannel(ABC):
         
         await self.bus.publish_inbound(msg)
     
+    @staticmethod
+    def _get_media_dir() -> Path:
+        """Return (and create) the shared media download directory."""
+        _MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        return _MEDIA_DIR
+
+    async def _download_media(
+        self,
+        data: bytes,
+        filename: str,
+    ) -> Path:
+        """Persist downloaded media bytes to the shared media directory.
+
+        Args:
+            data: Raw file bytes.
+            filename: Desired filename (the caller should ensure uniqueness).
+
+        Returns:
+            Path to the saved file.
+        """
+        media_dir = self._get_media_dir()
+        file_path = media_dir / filename
+        file_path.write_bytes(data)
+        return file_path
+
     @property
     def is_running(self) -> bool:
         """Check if the channel is running."""

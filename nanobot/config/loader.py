@@ -50,6 +50,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         config: Configuration to save.
         config_path: Optional path to save to. Uses default if not provided.
     """
+    import os
+
     path = config_path or get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -59,6 +61,12 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+    # Restrict permissions: config may contain API keys and secrets
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def convert_keys(data: Any) -> Any:

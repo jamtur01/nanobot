@@ -1,6 +1,5 @@
 """LiteLLM provider implementation for multi-provider support."""
 
-import os
 from typing import Any
 
 import litellm
@@ -15,6 +14,9 @@ class LiteLLMProvider(LLMProvider):
     
     Supports OpenRouter, Anthropic, OpenAI, Gemini, and many other providers through
     a unified interface.
+
+    API keys are passed via ``api_key`` in per-request kwargs rather than
+    written to ``os.environ``, preventing accidental exposure to subprocesses.
     """
     
     def __init__(
@@ -35,26 +37,8 @@ class LiteLLMProvider(LLMProvider):
         # Track if using custom endpoint (vLLM, etc.)
         self.is_vllm = bool(api_base) and not self.is_openrouter
         
-        # Configure LiteLLM based on provider
-        if api_key:
-            if self.is_openrouter:
-                # OpenRouter mode - set key
-                os.environ["OPENROUTER_API_KEY"] = api_key
-            elif self.is_vllm:
-                # vLLM/custom endpoint - uses OpenAI-compatible API
-                os.environ["OPENAI_API_KEY"] = api_key
-            elif "deepseek" in default_model:
-                os.environ.setdefault("DEEPSEEK_API_KEY", api_key)
-            elif "anthropic" in default_model:
-                os.environ.setdefault("ANTHROPIC_API_KEY", api_key)
-            elif "openai" in default_model or "gpt" in default_model:
-                os.environ.setdefault("OPENAI_API_KEY", api_key)
-            elif "gemini" in default_model.lower():
-                os.environ.setdefault("GEMINI_API_KEY", api_key)
-            elif "zhipu" in default_model or "glm" in default_model or "zai" in default_model:
-                os.environ.setdefault("ZHIPUAI_API_KEY", api_key)
-            elif "groq" in default_model:
-                os.environ.setdefault("GROQ_API_KEY", api_key)
+        # Store the key locally -- do NOT write to os.environ
+        self._api_key = api_key
         
         if api_base:
             litellm.api_base = api_base
@@ -114,6 +98,10 @@ class LiteLLMProvider(LLMProvider):
             "temperature": temperature,
         }
         
+        # Pass api_key per-request (avoids polluting os.environ)
+        if self._api_key:
+            kwargs["api_key"] = self._api_key
+
         # Pass api_base directly for custom endpoints (vLLM, etc.)
         if self.api_base:
             kwargs["api_base"] = self.api_base

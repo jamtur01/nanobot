@@ -19,19 +19,29 @@ HEARTBEAT_OK_TOKEN = "HEARTBEAT_OK"
 
 
 def _is_heartbeat_empty(content: str | None) -> bool:
-    """Check if HEARTBEAT.md has no actionable content."""
+    """Check if HEARTBEAT.md has no actionable content.
+
+    Lines that count as *non-actionable* (skipped):
+    - Empty lines
+    - Markdown headers (``# ...``)
+    - HTML comments (``<!-- ... -->``)
+    - Already-completed checkboxes (``- [x]``, ``* [x]``)
+
+    Unchecked checkboxes (``- [ ]``, ``* [ ]``) **are** actionable tasks
+    and will cause this function to return ``False``.
+    """
     if not content:
         return True
-    
-    # Lines to skip: empty, headers, HTML comments, empty checkboxes
-    skip_patterns = {"- [ ]", "* [ ]", "- [x]", "* [x]"}
-    
+
+    # Only completed checkboxes are non-actionable
+    skip_patterns = {"- [x]", "* [x]"}
+
     for line in content.split("\n"):
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("<!--") or line in skip_patterns:
             continue
-        return False  # Found actionable content
-    
+        return False  # Found actionable content (including unchecked checkboxes)
+
     return True
 
 

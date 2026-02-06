@@ -254,6 +254,17 @@ class CronService:
         jobs = store.jobs if include_disabled else [j for j in store.jobs if j.enabled]
         return sorted(jobs, key=lambda j: j.state.next_run_at_ms or float('inf'))
     
+    def _generate_unique_id(self) -> str:
+        """Generate a short job ID that doesn't collide with existing jobs."""
+        store = self._load_store()
+        existing_ids = {j.id for j in store.jobs}
+        for _ in range(100):
+            candidate = str(uuid.uuid4())[:8]
+            if candidate not in existing_ids:
+                return candidate
+        # Extremely unlikely fallback: use full UUID
+        return str(uuid.uuid4())
+
     def add_job(
         self,
         name: str,
@@ -269,7 +280,7 @@ class CronService:
         now = _now_ms()
         
         job = CronJob(
-            id=str(uuid.uuid4())[:8],
+            id=self._generate_unique_id(),
             name=name,
             enabled=True,
             schedule=schedule,

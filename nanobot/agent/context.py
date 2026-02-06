@@ -16,6 +16,9 @@ class ContextBuilder:
     
     Assembles bootstrap files, memory, skills, and conversation history
     into a coherent prompt for the LLM.
+
+    Bootstrap files are cached with mtime checking to avoid redundant
+    disk reads on every LLM call.
     """
     
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
@@ -24,6 +27,8 @@ class ContextBuilder:
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        # Cache: filename -> (mtime, content)
+        self._bootstrap_cache: dict[str, tuple[float, str]] = {}
     
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """
@@ -107,14 +112,25 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
 When remembering something, write to {workspace_path}/memory/MEMORY.md"""
     
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+        """Load bootstrap files from workspace, using an mtime-based cache."""
         parts = []
         
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
-            if file_path.exists():
+            if not file_path.exists():
+                # Remove stale cache entry if file was deleted
+                self._bootstrap_cache.pop(filename, None)
+                continue
+
+            mtime = file_path.stat().st_mtime
+            cached = self._bootstrap_cache.get(filename)
+            if cached and cached[0] == mtime:
+                content = cached[1]
+            else:
                 content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+                self._bootstrap_cache[filename] = (mtime, content)
+
+            parts.append(f"## {filename}\n\n{content}")
         
         return "\n\n".join(parts) if parts else ""
     

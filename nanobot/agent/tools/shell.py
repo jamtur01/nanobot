@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,18 @@ class ExecTool(Tool):
             r">\s*/dev/sd",                  # write to disk
             r"\b(shutdown|reboot|poweroff)\b",  # system power
             r":\(\)\s*\{.*\};\s*:",          # fork bomb
+            r"\beval\b",                     # eval can execute arbitrary code
+            r"\bbase64\s.*\|\s*(sh|bash)\b", # base64 decode piped to shell
+            r"\$\(",                         # subshell execution $(...)
+            r"`[^`]+`",                      # backtick subshell execution
+            r"\bpython[23]?\s+-c\b",         # python -c inline code
+            r"\bperl\s+-e\b",               # perl -e inline code
+            r"\bcurl\b.*\|\s*(sh|bash)\b",  # curl pipe to shell
+            r"\bwget\b.*\|\s*(sh|bash)\b",  # wget pipe to shell
+            r"\bchmod\s+[0-7]*[2367][0-7]*\b",  # making files world-writable
+            r"\bchown\b",                    # changing file ownership
+            r"\b(useradd|userdel|usermod)\b",  # user management
+            r"\b(visudo|passwd)\b",          # privilege escalation
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
@@ -72,6 +85,7 @@ class ExecTool(Tool):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                start_new_session=True,  # Create a process group so we can kill children
             )
             
             try:
@@ -80,7 +94,14 @@ class ExecTool(Tool):
                     timeout=self.timeout
                 )
             except asyncio.TimeoutError:
-                process.kill()
+                # Kill the entire process group (shell + children) to avoid zombies
+                if process.pid:
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        process.kill()
+                else:
+                    process.kill()
                 return f"Error: Command timed out after {self.timeout} seconds"
             
             output_parts = []

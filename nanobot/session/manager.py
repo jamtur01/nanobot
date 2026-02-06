@@ -1,6 +1,7 @@
 """Session management for conversation history."""
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,6 +10,13 @@ from typing import Any
 from loguru import logger
 
 from nanobot.utils.helpers import ensure_dir, safe_filename
+
+# Maximum messages kept in-memory per session. Older messages are pruned
+# on save, keeping storage and LLM context bounded.
+MAX_SESSION_MESSAGES = 200
+
+# Maximum sessions held in the in-memory LRU cache.
+MAX_CACHED_SESSIONS = 64
 
 
 @dataclass
@@ -35,6 +43,10 @@ class Session:
         }
         self.messages.append(msg)
         self.updated_at = datetime.now()
+
+        # Prune oldest messages when the in-memory list grows too large
+        if len(self.messages) > MAX_SESSION_MESSAGES:
+            self.messages = self.messages[-MAX_SESSION_MESSAGES:]
     
     def get_history(self, max_messages: int = 50) -> list[dict[str, Any]]:
         """
@@ -63,12 +75,14 @@ class SessionManager:
     Manages conversation sessions.
     
     Sessions are stored as JSONL files in the sessions directory.
+    Uses an LRU cache to bound memory usage.
     """
     
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, max_cache_size: int = MAX_CACHED_SESSIONS):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(Path.home() / ".nanobot" / "sessions")
-        self._cache: dict[str, Session] = {}
+        self._max_cache_size = max_cache_size
+        self._cache: OrderedDict[str, Session] = OrderedDict()
     
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -85,8 +99,9 @@ class SessionManager:
         Returns:
             The session.
         """
-        # Check cache
+        # Check cache (and move to end for LRU ordering)
         if key in self._cache:
+            self._cache.move_to_end(key)
             return self._cache[key]
         
         # Try to load from disk
@@ -94,6 +109,12 @@ class SessionManager:
         if session is None:
             session = Session(key=key)
         
+        # Evict oldest entry if cache is full
+        if len(self._cache) >= self._max_cache_size:
+            evicted_key, evicted_session = self._cache.popitem(last=False)
+            # Persist the evicted session so no data is lost
+            self._save_to_disk(evicted_session)
+
         self._cache[key] = session
         return session
     
@@ -134,9 +155,18 @@ class SessionManager:
             return None
     
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
+        """Save a session to disk and update the LRU cache."""
+        self._save_to_disk(session)
+        self._cache[session.key] = session
+        self._cache.move_to_end(session.key)
+
+    def _save_to_disk(self, session: Session) -> None:
+        """Write session data to its JSONL file."""
         path = self._get_session_path(session.key)
         
+        # Only persist the most recent messages
+        messages = session.messages[-MAX_SESSION_MESSAGES:]
+
         with open(path, "w") as f:
             # Write metadata first
             metadata_line = {
@@ -148,10 +178,8 @@ class SessionManager:
             f.write(json.dumps(metadata_line) + "\n")
             
             # Write messages
-            for msg in session.messages:
+            for msg in messages:
                 f.write(json.dumps(msg) + "\n")
-        
-        self._cache[session.key] = session
     
     def delete(self, key: str) -> bool:
         """

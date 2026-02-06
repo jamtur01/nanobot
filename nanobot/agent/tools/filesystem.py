@@ -6,9 +6,25 @@ from typing import Any
 from nanobot.agent.tools.base import Tool
 
 
+def _check_path_allowed(file_path: Path, allowed_roots: list[Path] | None) -> str | None:
+    """Return an error string if *file_path* is outside every *allowed_roots*, or None if OK."""
+    if not allowed_roots:
+        return None
+    resolved = file_path.resolve()
+    for root in allowed_roots:
+        root_resolved = root.resolve()
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            return None
+    roots_str = ", ".join(str(r) for r in allowed_roots)
+    return f"Error: Path '{file_path}' is outside the allowed directories ({roots_str})"
+
+
 class ReadFileTool(Tool):
     """Tool to read file contents."""
-    
+
+    def __init__(self, allowed_roots: list[Path] | None = None):
+        self._allowed_roots = allowed_roots
+
     @property
     def name(self) -> str:
         return "read_file"
@@ -33,6 +49,8 @@ class ReadFileTool(Tool):
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
             file_path = Path(path).expanduser()
+            if err := _check_path_allowed(file_path, self._allowed_roots):
+                return err
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             if not file_path.is_file():
@@ -48,7 +66,10 @@ class ReadFileTool(Tool):
 
 class WriteFileTool(Tool):
     """Tool to write content to a file."""
-    
+
+    def __init__(self, allowed_roots: list[Path] | None = None):
+        self._allowed_roots = allowed_roots
+
     @property
     def name(self) -> str:
         return "write_file"
@@ -77,6 +98,8 @@ class WriteFileTool(Tool):
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
             file_path = Path(path).expanduser()
+            if err := _check_path_allowed(file_path, self._allowed_roots):
+                return err
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {path}"
@@ -88,7 +111,10 @@ class WriteFileTool(Tool):
 
 class EditFileTool(Tool):
     """Tool to edit a file by replacing text."""
-    
+
+    def __init__(self, allowed_roots: list[Path] | None = None):
+        self._allowed_roots = allowed_roots
+
     @property
     def name(self) -> str:
         return "edit_file"
@@ -121,6 +147,8 @@ class EditFileTool(Tool):
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
             file_path = Path(path).expanduser()
+            if err := _check_path_allowed(file_path, self._allowed_roots):
+                return err
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             
@@ -146,7 +174,10 @@ class EditFileTool(Tool):
 
 class ListDirTool(Tool):
     """Tool to list directory contents."""
-    
+
+    def __init__(self, allowed_roots: list[Path] | None = None):
+        self._allowed_roots = allowed_roots
+
     @property
     def name(self) -> str:
         return "list_dir"
@@ -171,6 +202,8 @@ class ListDirTool(Tool):
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
             dir_path = Path(path).expanduser()
+            if err := _check_path_allowed(dir_path, self._allowed_roots):
+                return err
             if not dir_path.exists():
                 return f"Error: Directory not found: {path}"
             if not dir_path.is_dir():

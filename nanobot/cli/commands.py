@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import typer
+from loguru import logger
 from rich.console import Console
 from rich.table import Table
 
@@ -265,13 +266,30 @@ def gateway(
                 agent.run(),
                 channels.start_all(),
             )
-        except KeyboardInterrupt:
-            console.print("\nShutting down...")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            console.print("\nShutting down gracefully...")
+            # 1. Stop accepting new messages
+            agent.stop()
+            # 2. Stop cron / heartbeat so no new jobs fire
             heartbeat.stop()
             cron.stop()
-            agent.stop()
+            # 3. Drain in-flight messages (up to 5 s)
+            drain_timeout = 5.0
+            try:
+                await asyncio.wait_for(_drain_bus(bus), timeout=drain_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Bus drain timed out — forcing shutdown")
+            # 4. Disconnect channels last
             await channels.stop_all()
-    
+            console.print("Shutdown complete.")
+
+    async def _drain_bus(b: MessageBus) -> None:
+        """Wait until both inbound and outbound queues are empty."""
+        while b.inbound_size > 0 or b.outbound_size > 0:
+            await asyncio.sleep(0.2)
+
     asyncio.run(run())
 
 
