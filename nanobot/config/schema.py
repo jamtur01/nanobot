@@ -75,6 +75,19 @@ class GatewayConfig(BaseModel):
     port: int = 18790
 
 
+class GoogleConfig(BaseModel):
+    """Google integration configuration (Gmail, Calendar)."""
+    enabled: bool = False
+    client_id: str = ""
+    client_secret: str = ""
+    scopes: list[str] = Field(default_factory=lambda: [
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/calendar.readonly",
+    ])
+
+
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
     api_key: str = ""  # Brave Search API key
@@ -96,6 +109,7 @@ class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    google: GoogleConfig = Field(default_factory=GoogleConfig)
 
 
 class Config(BaseSettings):
