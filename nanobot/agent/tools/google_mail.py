@@ -1,8 +1,10 @@
 """Google Mail tool for reading, searching, and sending email via Gmail API."""
 
+import asyncio
 import base64
 import json
 from email.mime.text import MIMEText
+from functools import partial
 from typing import Any
 
 from loguru import logger
@@ -81,31 +83,29 @@ class GoogleMailTool(Tool):
         return self._service
 
     async def execute(self, action: str, **kwargs: Any) -> str:
+        """Dispatch to the synchronous Gmail helpers via a thread executor."""
         try:
+            loop = asyncio.get_running_loop()
             if action == "search":
-                return self._search(kwargs.get("query", ""), kwargs.get("max_results", 10))
+                fn = partial(self._search, kwargs.get("query", ""), kwargs.get("max_results", 10))
             elif action == "read":
-                return self._read(kwargs.get("message_id", ""))
+                fn = partial(self._read, kwargs.get("message_id", ""))
             elif action == "send":
-                return self._send(
-                    kwargs.get("to", ""),
-                    kwargs.get("subject", ""),
-                    kwargs.get("body", ""),
-                )
+                fn = partial(self._send, kwargs.get("to", ""), kwargs.get("subject", ""), kwargs.get("body", ""))
             elif action == "reply":
-                return self._reply(
-                    kwargs.get("message_id", ""),
-                    kwargs.get("body", ""),
-                )
+                fn = partial(self._reply, kwargs.get("message_id", ""), kwargs.get("body", ""))
             elif action == "list_labels":
-                return self._list_labels()
+                fn = self._list_labels
             elif action == "label":
-                return self._label(
+                fn = partial(
+                    self._label,
                     kwargs.get("message_id", ""),
                     kwargs.get("label_ids", []),
                     kwargs.get("remove_label_ids", []),
                 )
-            return f"Unknown action: {action}"
+            else:
+                return f"Unknown action: {action}"
+            return await loop.run_in_executor(None, fn)
         except Exception as e:
             logger.error(f"GoogleMailTool error: {e}")
             return f"Error: {e}"

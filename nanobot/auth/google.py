@@ -249,6 +249,8 @@ def _load_credentials(token_path: Path, scopes: list[str]) -> Any | None:
 
 def _save_credentials(creds: Any, token_path: Path) -> None:
     """Persist credentials to the token file."""
+    import os
+
     token_path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "token": creds.token,
@@ -259,3 +261,9 @@ def _save_credentials(creds: Any, token_path: Path) -> None:
         "scopes": list(creds.scopes) if creds.scopes else [],
     }
     token_path.write_text(json.dumps(data, indent=2))
+
+    # Restrict permissions: token file contains secrets
+    try:
+        os.chmod(token_path, 0o600)
+    except OSError:
+        pass
