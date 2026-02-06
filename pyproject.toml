@@ -29,6 +29,8 @@ dependencies = [
     "rich>=13.0.0",
     "croniter>=2.0.0",
     "python-telegram-bot>=21.0",
+    "slack-bolt>=1.18.0",
+    "slack-sdk>=3.27.0",
 ]
 
 [project.optional-dependencies]
