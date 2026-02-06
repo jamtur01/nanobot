@@ -174,6 +174,7 @@ Talk to your nanobot through Telegram, WhatsApp, or Feishu — anytime, anywhere
 |---------|-------|
 | **Telegram** | Easy (just a token) |
 | **WhatsApp** | Medium (scan QR) |
+| **Slack** | Medium (app + tokens) |
 | **Feishu** | Medium (app credentials) |
 
 <details>
@@ -242,6 +243,71 @@ nanobot channels login
 # Terminal 2
 nanobot gateway
 ```
+
+</details>
+
+<details>
+<summary><b>Slack</b></summary>
+
+Uses **Socket Mode** (WebSocket) — no public URL or ngrok required.
+
+**1. Create a Slack app**
+- Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch**
+- Give it a name and select your workspace
+
+**2. Enable Socket Mode**
+- Go to **Socket Mode** (left sidebar) → Toggle **Enable Socket Mode** on
+- Click **Generate** to create an App-Level Token with the `connections:write` scope
+- Copy the token (starts with `xapp-`)
+
+**3. Add bot permissions**
+- Go to **OAuth & Permissions** → **Scopes** → **Bot Token Scopes**, add:
+  - `chat:write` — Send messages
+  - `im:history` — Read DM history
+  - `im:read` — View DMs
+  - `channels:history` — Read channel messages
+  - `groups:history` — Read private channel messages
+  - `app_mentions:read` — Respond to @mentions
+  - `files:read` — Download shared files
+  - `users:read` — Look up usernames
+
+**4. Subscribe to events**
+- Go to **Event Subscriptions** → Toggle **Enable Events** on
+- Under **Subscribe to bot events**, add:
+  - `message.channels` — Messages in public channels
+  - `message.groups` — Messages in private channels
+  - `message.im` — Direct messages
+  - `app_mention` — When someone @mentions the bot
+
+**5. Install to workspace**
+- Go to **Install App** → **Install to Workspace** → Authorize
+- Copy the **Bot User OAuth Token** (starts with `xoxb-`)
+
+**6. Configure** (`~/.nanobot/config.json`)
+
+```json
+{
+  "channels": {
+    "slack": {
+      "enabled": true,
+      "botToken": "xoxb-YOUR-BOT-TOKEN",
+      "appToken": "xapp-YOUR-APP-TOKEN",
+      "allowFrom": []
+    }
+  }
+}
+```
+
+> `allowFrom`: Leave empty to allow all users, or add Slack user IDs like `["U01ABC123"]` to restrict access.
+
+**7. Run**
+
+```bash
+nanobot gateway
+```
+
+> [!TIP]
+> The bot responds to **DMs** automatically and to **@mentions** in any channel it's been added to. Invite it to a channel with `/invite @botname`.
 
 </details>
 
@@ -347,6 +413,12 @@ Config file: `~/.nanobot/config.json`
       "encryptKey": "",
       "verificationToken": "",
       "allowFrom": []
+    },
+    "slack": {
+      "enabled": false,
+      "botToken": "xoxb-xxx",
+      "appToken": "xapp-xxx",
+      "allowFrom": []
     }
   },
   "tools": {
@@ -447,7 +519,8 @@ PRs welcome! The codebase is intentionally small and readable. 🤗
 - [ ] **Multi-modal** — See and hear (images, voice, video)
 - [ ] **Long-term memory** — Never forget important context
 - [ ] **Better reasoning** — Multi-step planning and reflection
-- [ ] **More integrations** — Discord, Slack, email, calendar
+- [x] **Slack** — Slack channel support via Socket Mode
+- [ ] **More integrations** — Discord, email, calendar
 - [ ] **Self-improvement** — Learn from feedback and mistakes
 
 ### Contributors

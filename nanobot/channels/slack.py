@@ -34,6 +34,7 @@ class SlackChannel(BaseChannel):
         self._app: Any = None
         self._handler: Any = None
         self._bot_user_id: str = ""
+        self._web_client: Any = None
 
     async def start(self) -> None:
         """Start the Slack bot with Socket Mode."""
@@ -50,10 +51,11 @@ class SlackChannel(BaseChannel):
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
         self._app = AsyncApp(token=self.config.bot_token)
+        self._web_client = self._app.client
 
         # Fetch bot's own user ID so we can strip @mentions
         try:
-            auth = await self._app.client.auth_test()
+            auth = await self._web_client.auth_test()
             self._bot_user_id = auth.get("user_id", "")
             bot_name = auth.get("user", "unknown")
             logger.info(f"Slack bot connected as @{bot_name} (ID: {self._bot_user_id})")
@@ -61,18 +63,21 @@ class SlackChannel(BaseChannel):
             logger.error(f"Slack auth_test failed: {e}")
             return
 
-        # Register event listeners
+        # Register event listeners BEFORE starting the handler
         @self._app.event("message")
-        async def on_message(event: dict, say: Any) -> None:
+        async def on_message(body: dict, event: dict, say: Any, logger: Any) -> None:
             await self._on_message(event)
 
         @self._app.event("app_mention")
-        async def on_mention(event: dict, say: Any) -> None:
+        async def on_mention(body: dict, event: dict, say: Any, logger: Any) -> None:
             await self._on_message(event)
 
         logger.info("Starting Slack bot (Socket Mode)...")
         self._handler = AsyncSocketModeHandler(self._app, self.config.app_token)
-        await self._handler.start_async()
+
+        # connect_async() opens the WebSocket properly without blocking
+        await self._handler.connect_async()
+        logger.info("Slack Socket Mode connected and listening for events")
 
         # Keep running until stopped
         while self._running:
@@ -86,10 +91,11 @@ class SlackChannel(BaseChannel):
             await self._handler.close_async()
             self._handler = None
             self._app = None
+            self._web_client = None
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Slack."""
-        if not self._app:
+        if not self._web_client:
             logger.warning("Slack bot not running")
             return
 
@@ -98,7 +104,7 @@ class SlackChannel(BaseChannel):
 
             # Split long messages (Slack limit is ~40k but 4000 is more readable)
             for chunk in _split_message(content, limit=4000):
-                await self._app.client.chat_postMessage(
+                await self._web_client.chat_postMessage(
                     channel=msg.chat_id,
                     text=chunk,
                     mrkdwn=True,
@@ -119,6 +125,8 @@ class SlackChannel(BaseChannel):
         if not user_id or not channel_id:
             return
 
+        logger.info(f"Slack: received message from {user_id} in {channel_id}")
+
         # Strip the bot @mention from text
         if self._bot_user_id:
             text = re.sub(rf"<@{self._bot_user_id}>\s*", "", text).strip()
@@ -128,9 +136,9 @@ class SlackChannel(BaseChannel):
 
         # Build sender_id — try to enrich with username
         sender_id = user_id
-        if self._app:
+        if self._web_client:
             try:
-                info = await self._app.client.users_info(user=user_id)
+                info = await self._web_client.users_info(user=user_id)
                 username = info.get("user", {}).get("name", "")
                 if username:
                     sender_id = f"{user_id}|{username}"
@@ -169,7 +177,7 @@ class SlackChannel(BaseChannel):
 
     async def _download_file(self, file_info: dict) -> str | None:
         """Download a Slack file to local media directory."""
-        if not self._app:
+        if not self._web_client:
             return None
 
         url = file_info.get("url_private_download") or file_info.get("url_private")
