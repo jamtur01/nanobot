@@ -46,8 +46,9 @@ class AgentLoop:
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
         google_config: "GoogleConfig | None" = None,
+        compaction_config: "CompactionConfig | None" = None,
     ):
-        from nanobot.config.schema import ExecToolConfig, GoogleConfig
+        from nanobot.config.schema import ExecToolConfig, GoogleConfig, CompactionConfig
         from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
@@ -59,6 +60,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self.google_config = google_config
+        self.compaction_config = compaction_config or CompactionConfig()
         
         self.context = ContextBuilder(workspace)
         self.sessions = SessionManager(workspace)
@@ -73,6 +75,18 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
         )
         
+        # Compaction / extraction
+        self._compactor = None
+        if self.compaction_config.enabled:
+            from nanobot.agent.compaction import MessageCompactor
+            self._compactor = MessageCompactor(
+                provider=provider,
+                model=self.compaction_config.model,
+            )
+
+        # Serializes daemon execution with user message processing
+        self._processing_lock = asyncio.Lock()
+
         self._running = False
         self._register_default_tools()
     
@@ -104,6 +118,10 @@ class AgentLoop:
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
         
+        # Tmux tool (persistent shell sessions)
+        from nanobot.agent.tools.tmux import TmuxTool
+        self.tools.register(TmuxTool())
+
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -177,6 +195,8 @@ class AgentLoop:
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a single inbound message.
+
+        Acquires processing lock to serialize with daemon execution.
         
         Args:
             msg: The inbound message to process.
@@ -184,6 +204,11 @@ class AgentLoop:
         Returns:
             The response message, or None if no response needed.
         """
+        async with self._processing_lock:
+            return await self._process_message_unlocked(msg)
+
+    async def _process_message_unlocked(self, msg: InboundMessage) -> OutboundMessage | None:
+        """Inner message processing (called under lock)."""
         # Handle system messages (subagent announces)
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
@@ -207,9 +232,12 @@ class AgentLoop:
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(msg.channel, msg.chat_id)
         
-        # Build initial messages (use get_history for LLM-formatted messages)
+        # Get history, applying compaction if needed
+        history = await self._get_compacted_history(session)
+        
+        # Build initial messages
         messages = self.context.build_messages(
-            history=session.get_history(),
+            history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel,
@@ -269,12 +297,98 @@ class AgentLoop:
         session.add_message("assistant", final_content)
         self.sessions.save(session)
         
+        # Background fact extraction (fire and forget)
+        if (
+            self._compactor
+            and self.compaction_config.extraction_enabled
+            and msg.channel != "system"
+        ):
+            asyncio.create_task(
+                self._extract_and_save_facts(msg.content, final_content)
+            )
+        
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content
         )
     
+    async def _get_compacted_history(
+        self, session: "Session"
+    ) -> list[dict[str, Any]]:
+        """Get session history, compacting older messages if over threshold."""
+        from nanobot.agent.compaction import estimate_messages_tokens
+
+        if not self._compactor or not self.compaction_config.enabled:
+            return session.get_history()
+
+        full_history = session.get_full_history()
+        if not full_history:
+            return []
+
+        keep_recent = self.compaction_config.keep_recent
+        threshold = self.compaction_config.threshold_tokens
+        token_est = estimate_messages_tokens(full_history)
+
+        # Under threshold - return as-is (with normal truncation)
+        if token_est < threshold:
+            return session.get_history()
+
+        # Split into old and recent
+        if len(full_history) <= keep_recent:
+            return full_history
+
+        old_messages = full_history[:-keep_recent]
+        recent_messages = full_history[-keep_recent:]
+
+        # Get existing summary if any
+        prev_summary = session.metadata.get("compaction_summary", "")
+
+        # Check if we've already compacted up to this point
+        compacted_up_to = session.metadata.get("compacted_up_to", 0)
+        if compacted_up_to >= len(old_messages):
+            # Already compacted, just prepend existing summary
+            if prev_summary:
+                summary_msg = {
+                    "role": "assistant",
+                    "content": f"[Earlier conversation summary]\n{prev_summary}",
+                }
+                return [summary_msg] + recent_messages
+            return recent_messages
+
+        # Run compaction
+        logger.info(
+            f"Compacting {len(old_messages)} messages "
+            f"(~{estimate_messages_tokens(old_messages)} tokens)"
+        )
+        summary = await self._compactor.compact(old_messages, prev_summary)
+
+        # Store in session metadata
+        session.metadata["compaction_summary"] = summary
+        session.metadata["compacted_up_to"] = len(old_messages)
+        self.sessions.save(session)
+
+        summary_msg = {
+            "role": "assistant",
+            "content": f"[Earlier conversation summary]\n{summary}",
+        }
+        return [summary_msg] + recent_messages
+
+    async def _extract_and_save_facts(
+        self, user_message: str, assistant_message: str
+    ) -> None:
+        """Extract facts from an exchange and save to today's daily note."""
+        try:
+            assert self._compactor is not None
+            facts = await self._compactor.extract_facts(user_message, assistant_message)
+            if facts:
+                from nanobot.agent.memory import MemoryStore
+                memory = MemoryStore(self.workspace)
+                memory.append_today(f"\n### Extracted Facts\n{facts}\n")
+                logger.debug(f"Extracted facts saved to daily note")
+        except Exception as e:
+            logger.warning(f"Fact extraction failed: {e}")
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).

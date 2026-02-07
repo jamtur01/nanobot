@@ -6,6 +6,8 @@ import platform
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 
@@ -24,6 +26,10 @@ class ContextBuilder:
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        
+        # Bootstrap file caching
+        self._bootstrap_cache: str | None = None
+        self._bootstrap_mtimes: dict[str, float] = {}
     
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """
@@ -71,14 +77,47 @@ Skills with available="false" need dependencies installed first - you can try in
         return "\n\n---\n\n".join(parts)
     
     def _get_identity(self) -> str:
-        """Get the core identity section."""
+        """Get the core identity section, loading from IDENTITY.md if available."""
         from datetime import datetime
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
         
-        return f"""# nanobot 🐈
+        # Try to load identity from IDENTITY.md
+        identity_file = self.workspace / "IDENTITY.md"
+        if identity_file.exists():
+            try:
+                identity_content = identity_file.read_text(encoding="utf-8")
+                return self._build_identity_with_context(
+                    identity_content, now, runtime, workspace_path
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load IDENTITY.md, using defaults: {e}")
+        
+        # Fallback to hardcoded defaults
+        return self._get_default_identity(now, runtime, workspace_path)
+    
+    def _build_identity_with_context(
+        self, identity_content: str, now: str, runtime: str, workspace_path: str
+    ) -> str:
+        """Build identity from IDENTITY.md content with dynamic context appended."""
+        return f"""{identity_content}
+
+## Current Context
+
+**Time**: {now}
+**Runtime**: {runtime}
+**Workspace**: {workspace_path}
+- Memory files: {workspace_path}/memory/MEMORY.md
+- Daily notes: {workspace_path}/memory/YYYY-MM-DD.md
+- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+
+{self._get_behavioural_notes(workspace_path)}"""
+    
+    def _get_default_identity(self, now: str, runtime: str, workspace_path: str) -> str:
+        """Get the hardcoded default identity (fallback when IDENTITY.md doesn't exist)."""
+        return f"""# nanobot
 
 You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
 - Read, write, and edit files
@@ -99,7 +138,11 @@ Your workspace is at: {workspace_path}
 - Daily notes: {workspace_path}/memory/YYYY-MM-DD.md
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
-IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
+{self._get_behavioural_notes(workspace_path)}"""
+    
+    def _get_behavioural_notes(self, workspace_path: str) -> str:
+        """Get behavioural instructions appended to both custom and default identity."""
+        return f"""IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
 Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 For normal conversation, just respond with text - do not call the message tool.
 
@@ -107,16 +150,37 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
 When remembering something, write to {workspace_path}/memory/MEMORY.md"""
     
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
-        parts = []
-        
+        """Load all bootstrap files from workspace, with mtime-based caching."""
+        # Check if any file has been modified since last cache
+        current_mtimes: dict[str, float] = {}
         for filename in self.BOOTSTRAP_FILES:
+            # Skip IDENTITY.md - it's handled separately in _get_identity
+            if filename == "IDENTITY.md":
+                continue
             file_path = self.workspace / filename
             if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+                current_mtimes[filename] = file_path.stat().st_mtime
         
-        return "\n\n".join(parts) if parts else ""
+        # Return cached content if nothing changed
+        if self._bootstrap_cache is not None and current_mtimes == self._bootstrap_mtimes:
+            return self._bootstrap_cache
+        
+        # Rebuild from disk
+        parts = []
+        for filename in self.BOOTSTRAP_FILES:
+            if filename == "IDENTITY.md":
+                continue
+            file_path = self.workspace / filename
+            if file_path.exists():
+                try:
+                    content = file_path.read_text(encoding="utf-8")
+                    parts.append(f"## {filename}\n\n{content}")
+                except Exception as e:
+                    logger.warning(f"Failed to read bootstrap file {filename}: {e}")
+        
+        self._bootstrap_cache = "\n\n".join(parts) if parts else ""
+        self._bootstrap_mtimes = current_mtimes
+        return self._bootstrap_cache
     
     def build_messages(
         self,

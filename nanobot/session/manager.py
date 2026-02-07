@@ -52,6 +52,18 @@ class Session:
         # Convert to LLM format (just role and content)
         return [{"role": m["role"], "content": m["content"]} for m in recent]
     
+    def get_full_history(self) -> list[dict[str, Any]]:
+        """
+        Get all messages in LLM format (no truncation).
+        
+        Used by the compaction system which needs to see the full history
+        to decide what to summarize.
+        
+        Returns:
+            List of all messages in LLM format.
+        """
+        return [{"role": m["role"], "content": m["content"]} for m in self.messages]
+    
     def clear(self) -> None:
         """Clear all messages in the session."""
         self.messages = []

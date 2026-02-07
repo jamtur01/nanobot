@@ -54,6 +54,32 @@ class ChannelsConfig(BaseModel):
     slack: SlackConfig = Field(default_factory=SlackConfig)
 
 
+class CompactionConfig(BaseModel):
+    """Context window compaction: summarize old messages to stay within limits."""
+    enabled: bool = True
+    threshold_tokens: int = Field(default=40000, alias="thresholdTokens")
+    keep_recent: int = Field(default=10, alias="keepRecent")
+    extraction_enabled: bool = Field(default=True, alias="extractionEnabled")
+    model: str | None = None  # Optional cheap model override for compaction/extraction
+
+    model_config = {"populate_by_name": True}
+
+
+class DaemonConfig(BaseModel):
+    """Daemon mode: three-tier autonomous agent execution."""
+    enabled: bool = True
+    interval: int = Field(default=300, alias="interval")
+    triage_model: str | None = Field(default=None, alias="triageModel")
+    triage_provider: str | None = Field(default=None, alias="triageProvider")
+    execution_model: str | None = Field(default=None, alias="executionModel")
+    execution_provider: str | None = Field(default=None, alias="executionProvider")
+    strategy_file: str = Field(default="HEARTBEAT.md", alias="strategyFile")
+    max_iterations: int = Field(default=25, alias="maxIterations")
+    cooldown_after_action: int = Field(default=600, alias="cooldownAfterAction")
+
+    model_config = {"populate_by_name": True}
+
+
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.nanobot/workspace"
@@ -61,6 +87,8 @@ class AgentDefaults(BaseModel):
     max_tokens: int = 8192
     temperature: float = 0.7
     max_tool_iterations: int = 20
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig, alias="compaction")
+    daemon: DaemonConfig = Field(default_factory=DaemonConfig, alias="daemon")
 
 
 class AgentsConfig(BaseModel):
