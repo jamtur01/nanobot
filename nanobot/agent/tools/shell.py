@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -23,14 +24,28 @@ class ExecTool(Tool):
         self.timeout = timeout
         self.working_dir = working_dir
         self.deny_patterns = deny_patterns or [
-            r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
-            r"\bdel\s+/[fq]\b",              # del /f, del /q
-            r"\brmdir\s+/s\b",               # rmdir /s
-            r"\b(format|mkfs|diskpart)\b",   # disk operations
-            r"\bdd\s+if=",                   # dd
-            r">\s*/dev/sd",                  # write to disk
-            r"\b(shutdown|reboot|poweroff)\b",  # system power
-            r":\(\)\s*\{.*\};\s*:",          # fork bomb
+            # File deletion
+            r"\brm\s+-[rf]{1,2}\b",             # rm -r, rm -rf, rm -fr
+            r"\bdel\s+/[fq]\b",                 # del /f, del /q
+            r"\brmdir\s+/s\b",                  # rmdir /s
+            # Disk operations
+            r"\b(format|mkfs|diskpart)\b",
+            r"\bdd\s+if=",
+            r">\s*/dev/sd",
+            # System power
+            r"\b(shutdown|reboot|poweroff)\b",
+            # Fork bomb
+            r":\(\)\s*\{.*\};\s*:",
+            # Dangerous eval / piped-to-shell patterns
+            r"\beval\b",
+            r"\bbase64\b.*\|\s*(sh|bash|zsh)\b",
+            r"\b(curl|wget)\b.*\|\s*(sh|bash|zsh|python)\b",
+            r"\bpython[23]?\s+-c\b",
+            # Permission / ownership escalation
+            r"\bchmod\b.*\bo?[0-7]*7[0-7]{0,2}\b",   # world-writable
+            r"\bchown\b",
+            # User management
+            r"\b(useradd|userdel|usermod|passwd|adduser|deluser)\b",
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
@@ -72,6 +87,7 @@ class ExecTool(Tool):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                start_new_session=True,  # isolate in its own process group
             )
             
             try:
@@ -80,7 +96,14 @@ class ExecTool(Tool):
                     timeout=self.timeout
                 )
             except asyncio.TimeoutError:
-                process.kill()
+                # Kill the entire process group (including children)
+                if process.pid:
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        process.kill()
+                else:
+                    process.kill()
                 return f"Error: Command timed out after {self.timeout} seconds"
             
             output_parts = []

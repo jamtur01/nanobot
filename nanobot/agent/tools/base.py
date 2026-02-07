@@ -1,7 +1,29 @@
 """Base class for agent tools."""
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any
+
+
+@dataclass
+class ToolResult:
+    """Typed result from a tool execution.
+
+    Tools may return either a plain ``str`` (backward-compatible) or a
+    ``ToolResult`` instance for richer metadata.
+    """
+
+    content: str
+    """The textual output shown to the LLM."""
+
+    is_error: bool = False
+    """True when the result represents an error."""
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Arbitrary metadata (not sent to the LLM)."""
+
+    def __str__(self) -> str:  # noqa: D105
+        return self.content
 
 
 class Tool(ABC):

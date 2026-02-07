@@ -1,6 +1,7 @@
 """Configuration loading utilities."""
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,12 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+    # Config may contain API keys – restrict file permissions
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass  # best-effort (e.g. Windows)
 
 
 def _migrate_config(data: dict) -> dict:

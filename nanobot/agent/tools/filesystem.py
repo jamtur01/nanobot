@@ -6,19 +6,24 @@ from typing import Any
 from nanobot.agent.tools.base import Tool
 
 
-def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:
-    """Resolve path and optionally enforce directory restriction."""
-    resolved = Path(path).expanduser().resolve()
-    if allowed_dir and not str(resolved).startswith(str(allowed_dir.resolve())):
-        raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
-    return resolved
+def _check_path_allowed(file_path: Path, allowed_roots: list[Path] | None) -> str | None:
+    """Return an error string if *file_path* is outside every *allowed_roots*, or None if OK."""
+    if not allowed_roots:
+        return None
+    resolved = file_path.resolve()
+    for root in allowed_roots:
+        root_resolved = root.resolve()
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            return None
+    roots_str = ", ".join(str(r) for r in allowed_roots)
+    return f"Error: Path '{file_path}' is outside the allowed directories ({roots_str})"
 
 
 class ReadFileTool(Tool):
     """Tool to read file contents."""
-    
-    def __init__(self, allowed_dir: Path | None = None):
-        self._allowed_dir = allowed_dir
+
+    def __init__(self, allowed_roots: list[Path] | None = None):
+        self._allowed_roots = allowed_roots
 
     @property
     def name(self) -> str:
@@ -43,7 +48,9 @@ class ReadFileTool(Tool):
     
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._allowed_dir)
+            file_path = Path(path).expanduser()
+            if err := _check_path_allowed(file_path, self._allowed_roots):
+                return err
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             if not file_path.is_file():
@@ -51,17 +58,17 @@ class ReadFileTool(Tool):
             
             content = file_path.read_text(encoding="utf-8")
             return content
-        except PermissionError as e:
-            return f"Error: {e}"
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
         except Exception as e:
             return f"Error reading file: {str(e)}"
 
 
 class WriteFileTool(Tool):
     """Tool to write content to a file."""
-    
-    def __init__(self, allowed_dir: Path | None = None):
-        self._allowed_dir = allowed_dir
+
+    def __init__(self, allowed_roots: list[Path] | None = None):
+        self._allowed_roots = allowed_roots
 
     @property
     def name(self) -> str:
@@ -90,21 +97,23 @@ class WriteFileTool(Tool):
     
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._allowed_dir)
+            file_path = Path(path).expanduser()
+            if err := _check_path_allowed(file_path, self._allowed_roots):
+                return err
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {path}"
-        except PermissionError as e:
-            return f"Error: {e}"
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
         except Exception as e:
             return f"Error writing file: {str(e)}"
 
 
 class EditFileTool(Tool):
     """Tool to edit a file by replacing text."""
-    
-    def __init__(self, allowed_dir: Path | None = None):
-        self._allowed_dir = allowed_dir
+
+    def __init__(self, allowed_roots: list[Path] | None = None):
+        self._allowed_roots = allowed_roots
 
     @property
     def name(self) -> str:
@@ -137,7 +146,9 @@ class EditFileTool(Tool):
     
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._allowed_dir)
+            file_path = Path(path).expanduser()
+            if err := _check_path_allowed(file_path, self._allowed_roots):
+                return err
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             
@@ -155,17 +166,17 @@ class EditFileTool(Tool):
             file_path.write_text(new_content, encoding="utf-8")
             
             return f"Successfully edited {path}"
-        except PermissionError as e:
-            return f"Error: {e}"
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
         except Exception as e:
             return f"Error editing file: {str(e)}"
 
 
 class ListDirTool(Tool):
     """Tool to list directory contents."""
-    
-    def __init__(self, allowed_dir: Path | None = None):
-        self._allowed_dir = allowed_dir
+
+    def __init__(self, allowed_roots: list[Path] | None = None):
+        self._allowed_roots = allowed_roots
 
     @property
     def name(self) -> str:
@@ -190,7 +201,9 @@ class ListDirTool(Tool):
     
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            dir_path = _resolve_path(path, self._allowed_dir)
+            dir_path = Path(path).expanduser()
+            if err := _check_path_allowed(dir_path, self._allowed_roots):
+                return err
             if not dir_path.exists():
                 return f"Error: Directory not found: {path}"
             if not dir_path.is_dir():
@@ -205,7 +218,7 @@ class ListDirTool(Tool):
                 return f"Directory {path} is empty"
             
             return "\n".join(items)
-        except PermissionError as e:
-            return f"Error: {e}"
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
         except Exception as e:
             return f"Error listing directory: {str(e)}"

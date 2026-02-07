@@ -1,8 +1,11 @@
 """Base channel interface for chat platforms."""
 
+import hashlib
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
+import httpx
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -83,6 +86,43 @@ class BaseChannel(ABC):
                     return True
         return False
     
+    # ------------------------------------------------------------------
+    # Media helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_media_dir() -> Path:
+        """Return (and ensure) the shared media download directory."""
+        d = Path.home() / ".nanobot" / "media"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    async def _download_media(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        suffix: str = "",
+    ) -> Path:
+        """Download a URL to the shared media directory.
+
+        Returns the local Path on success.  Filenames are derived from the
+        URL content hash to avoid collisions while deduplicating identical
+        downloads.
+        """
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers or {})
+            resp.raise_for_status()
+            data = resp.content
+
+        name = hashlib.sha256(data).hexdigest()[:16] + suffix
+        dest = self._get_media_dir() / name
+        dest.write_bytes(data)
+        logger.debug(f"Downloaded media to {dest} ({len(data)} bytes)")
+        return dest
+
+    # ------------------------------------------------------------------
+
     async def _handle_message(
         self,
         sender_id: str,
@@ -104,10 +144,6 @@ class BaseChannel(ABC):
             metadata: Optional channel-specific metadata.
         """
         if not self.is_allowed(sender_id):
-            logger.warning(
-                f"Access denied for sender {sender_id} on channel {self.name}. "
-                f"Add them to allowFrom list in config to grant access."
-            )
             return
         
         msg = InboundMessage(
