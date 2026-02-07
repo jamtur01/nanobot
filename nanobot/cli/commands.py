@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import typer
+from loguru import logger
 from rich.console import Console
 from rich.table import Table
 
@@ -224,12 +225,19 @@ def gateway(
             chat_id=job.payload.to or "direct",
         )
         if job.payload.deliver and job.payload.to:
-            from nanobot.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response or ""
-            ))
+            target_channel = job.payload.channel
+            if not target_channel:
+                logger.warning(
+                    f"Cron job '{job.name}' has deliver=True but no channel set, "
+                    "skipping delivery"
+                )
+            else:
+                from nanobot.bus.events import OutboundMessage
+                await bus.publish_outbound(OutboundMessage(
+                    channel=target_channel,
+                    chat_id=job.payload.to,
+                    content=response or ""
+                ))
         return response
     cron.on_job = on_cron_job
     

@@ -135,6 +135,7 @@ class LiteLLMProvider(LLMProvider):
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "drop_params": True,
         }
         
         # Pass api_base directly for custom endpoints (vLLM, etc.)

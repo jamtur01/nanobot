@@ -319,12 +319,17 @@ class CronService:
         logger.info(f"Cron: added job '{name}' ({job.id})")
         return job
     
-    def remove_job(self, job_id: str) -> bool:
-        """Remove a job by ID."""
+    def remove_job(self, job_id: str) -> CronJob | None:
+        """Remove a job by ID. Returns the removed job, or None if not found."""
         store = self._load_store()
-        before = len(store.jobs)
-        store.jobs = [j for j in store.jobs if j.id != job_id]
-        removed = len(store.jobs) < before
+        removed = None
+        remaining = []
+        for j in store.jobs:
+            if j.id == job_id:
+                removed = j
+            else:
+                remaining.append(j)
+        store.jobs = remaining
         
         if removed:
             self._save_store()

@@ -36,6 +36,8 @@ export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
   private reconnecting = false;
+  /** IDs of messages we sent, so we can skip our own outbound echoes */
+  private sentMessageIds = new Set<string>();
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
@@ -109,8 +111,9 @@ export class WhatsAppClient {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        // Skip own messages
-        if (msg.key.fromMe) continue;
+        // Skip messages that *we* sent (prevents echo loops) while still
+        // allowing the user's own "Message Yourself" chat to work.
+        if (this.sentMessageIds.delete(msg.key.id || '')) continue;
 
         // Skip status updates
         if (msg.key.remoteJid === 'status@broadcast') continue;
@@ -120,9 +123,15 @@ export class WhatsAppClient {
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
 
+        // Prefer the phone-number JID (remoteJidAlt / @s.whatsapp.net)
+        // over the opaque LID (@lid) so allowFrom lists work with phone
+        // numbers.  Fall back to remoteJid if no alt is available.
+        const sender: string =
+          (msg.key as any).remoteJidAlt || msg.key.remoteJid || '';
+
         this.options.onMessage({
           id: msg.key.id || '',
-          sender: msg.key.remoteJid || '',
+          sender,
           content,
           timestamp: msg.messageTimestamp as number,
           isGroup,
@@ -173,7 +182,16 @@ export class WhatsAppClient {
       throw new Error('Not connected');
     }
 
-    await this.sock.sendMessage(to, { text });
+    const sent = await this.sock.sendMessage(to, { text });
+    // Track the ID so we skip this message when it echoes back
+    if (sent?.key?.id) {
+      this.sentMessageIds.add(sent.key.id);
+      // Safety: cap the set size to prevent unbounded growth
+      if (this.sentMessageIds.size > 500) {
+        const first = this.sentMessageIds.values().next().value;
+        if (first !== undefined) this.sentMessageIds.delete(first);
+      }
+    }
   }
 
   async disconnect(): Promise<void> {

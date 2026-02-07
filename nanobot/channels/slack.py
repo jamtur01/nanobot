@@ -77,6 +77,13 @@ class SlackChannel(BaseChannel):
 
         # connect_async() opens the WebSocket properly without blocking
         await self._handler.connect_async()
+
+        # Mark bot as "active" (green dot) — without this Slack shows "away"
+        try:
+            await self._web_client.users_setPresence(presence="auto")
+        except Exception as e:
+            logger.warning(f"Failed to set Slack presence: {e}")
+
         logger.info("Slack Socket Mode connected and listening for events")
 
         # Keep running until stopped

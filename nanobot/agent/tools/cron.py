@@ -26,7 +26,10 @@ class CronTool(Tool):
     
     @property
     def description(self) -> str:
-        return "Schedule reminders and recurring tasks. Actions: add, list, remove."
+        return (
+            "Schedule reminders and recurring tasks. Actions: add, list, remove. "
+            "Jobs are automatically delivered to the current conversation."
+        )
     
     @property
     def parameters(self) -> dict[str, Any]:

@@ -77,13 +77,14 @@ class BaseChannel(ABC):
         if not allow_list:
             return True
         
+        # Normalize: strip leading '+' so both "+1234" and "1234" match
+        normalized = {a.lstrip("+") for a in allow_list}
+        
         sender_str = str(sender_id)
-        if sender_str in allow_list:
-            return True
-        if "|" in sender_str:
-            for part in sender_str.split("|"):
-                if part and part in allow_list:
-                    return True
+        parts = sender_str.split("|") if "|" in sender_str else [sender_str]
+        for part in parts:
+            if part and (part in normalized or part.lstrip("+") in normalized):
+                return True
         return False
     
     # ------------------------------------------------------------------
