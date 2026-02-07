@@ -175,28 +175,24 @@ class TelegramChannel(BaseChannel):
                 bot_info = await self._app.bot.get_me()
                 logger.info(f"Telegram bot @{bot_info.username} connected")
 
-                # Start polling as a task so we can monitor it
-                polling_task = asyncio.ensure_future(
-                    self._app.updater.start_polling(
-                        allowed_updates=["message"],
-                        drop_pending_updates=True,
-                    )
+                # start_polling() returns immediately after launching the
+                # background polling coroutine -- it is NOT blocking.
+                await self._app.updater.start_polling(
+                    allowed_updates=["message"],
+                    drop_pending_updates=True,
                 )
 
                 logger.info("Telegram polling started successfully")
                 retries = 0  # reset on success
                 backoff = INITIAL_BACKOFF_S
 
-                # Monitor polling -- if it dies, break out to retry
+                # Monitor the updater's running flag
                 while self._running:
-                    if polling_task.done():
-                        exc = polling_task.exception()
-                        if exc:
-                            raise exc
-                        # Task finished without error -- unexpected, retry
-                        logger.warning("Telegram polling task exited unexpectedly")
+                    if not self._app.updater.running:
+                        logger.warning("Telegram updater stopped unexpectedly")
+                        retries += 1
                         break
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
 
             except Conflict:
                 logger.error(
