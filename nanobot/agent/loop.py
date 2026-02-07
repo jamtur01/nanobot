@@ -45,8 +45,9 @@ class AgentLoop:
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
+        google_config: "GoogleConfig | None" = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ExecToolConfig, GoogleConfig
         from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
@@ -57,6 +58,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.google_config = google_config
         
         self.context = ContextBuilder(workspace)
         self.sessions = SessionManager(workspace)
@@ -105,7 +107,39 @@ class AgentLoop:
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+        # Google tools (Gmail, Calendar)
+        self._register_google_tools()
     
+    def _register_google_tools(self) -> None:
+        """Register Google tools if configured and credentials are available."""
+        if not self.google_config or not self.google_config.enabled:
+            return
+        if not self.google_config.client_id or not self.google_config.client_secret:
+            logger.warning("Google enabled but client_id/client_secret not set — skipping")
+            return
+
+        try:
+            from nanobot.auth.google import get_credentials
+            from nanobot.agent.tools.google_mail import GoogleMailTool
+            from nanobot.agent.tools.google_calendar import GoogleCalendarTool
+
+            creds = get_credentials(
+                client_id=self.google_config.client_id,
+                client_secret=self.google_config.client_secret,
+                scopes=self.google_config.scopes,
+            )
+            self.tools.register(GoogleMailTool(creds))
+            self.tools.register(GoogleCalendarTool(creds))
+            logger.info("Google tools registered (gmail, calendar)")
+        except RuntimeError as e:
+            logger.warning(f"Google tools not available: {e}")
+        except ImportError as e:
+            logger.warning(
+                f"Google dependencies not installed. "
+                f"Install with: pip install nanobot-ai[google]  ({e})"
+            )
+
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True

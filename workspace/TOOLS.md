@@ -140,6 +140,31 @@ write_file(
 )
 ```
 
+## Google Integration
+
+### google_mail
+Interact with Gmail (requires Google auth setup).
+```
+google_mail(action: str, query: str = None, message_id: str = None, to: str = None, subject: str = None, body: str = None, ...) -> str
+```
+
+Actions: `search`, `read`, `send`, `reply`, `list_labels`, `label`
+
+### google_calendar
+Interact with Google Calendar (requires Google auth setup).
+```
+google_calendar(action: str, calendar_id: str = "primary", event_id: str = None, summary: str = None, start: str = None, end: str = None, ...) -> str
+```
+
+Actions: `list_events`, `get_event`, `create_event`, `update_event`, `delete_event`, `list_calendars`
+
+**Setup:**
+1. Enable Gmail and Calendar APIs at https://console.cloud.google.com/
+2. Create OAuth2 credentials (Desktop app)
+3. Add `clientId` and `clientSecret` to `~/.nanobot/config.json` under `tools.google`
+4. Set `tools.google.enabled` to `true`
+5. Run `nanobot auth google` to authenticate
+
 ---
 
 ## Adding Custom Tools
