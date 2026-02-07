@@ -392,6 +392,15 @@ def channels_status():
         tg_config
     )
 
+    # Discord
+    dc = config.channels.discord
+    dc_config = f"token: {dc.token[:10]}..." if dc.token else "[dim]not configured[/dim]"
+    table.add_row(
+        "Discord",
+        "✓" if dc.enabled else "✗",
+        dc_config
+    )
+
     console.print(table)
 
 

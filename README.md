@@ -169,7 +169,7 @@ Talk to your nanobot through Telegram, Discord, WhatsApp, or Feishu — anytime,
 | Channel | Setup |
 |---------|-------|
 | **Telegram** | Easy (just a token) |
-| **Discord** | Easy (bot token + intents) |
+| **Discord** | Easy (bot token) |
 | **WhatsApp** | Medium (scan QR) |
 | **Feishu** | Medium (app credentials) |
 
@@ -208,6 +208,8 @@ nanobot gateway
 <details>
 <summary><b>Discord</b></summary>
 
+Uses the [discord.py](https://discordpy.readthedocs.io/) library. The bot responds to **DMs** automatically and to **guild messages** when mentioned (`@botname`).
+
 **1. Create a bot**
 - Go to https://discord.com/developers/applications
 - Create an application → Bot → Add Bot
@@ -215,13 +217,18 @@ nanobot gateway
 
 **2. Enable intents**
 - In the Bot settings, enable **MESSAGE CONTENT INTENT**
-- (Optional) Enable **SERVER MEMBERS INTENT** if you plan to use allow lists based on member data
 
-**3. Get your User ID**
+**3. Invite the bot**
+- OAuth2 → URL Generator
+- Scopes: `bot`
+- Bot Permissions: `Send Messages`, `Read Message History`, `Attach Files`
+- Open the generated invite URL and add the bot to your server
+
+**4. Get your User ID**
 - Discord Settings → Advanced → enable **Developer Mode**
 - Right-click your avatar → **Copy User ID**
 
-**4. Configure**
+**5. Configure**
 
 ```json
 {
@@ -235,17 +242,19 @@ nanobot gateway
 }
 ```
 
-**5. Invite the bot**
-- OAuth2 → URL Generator
-- Scopes: `bot`
-- Bot Permissions: `Send Messages`, `Read Message History`
-- Open the generated invite URL and add the bot to your server
-
 **6. Run**
 
 ```bash
 nanobot gateway
 ```
+
+**Features:**
+- Threaded replies to the original message
+- Typing indicator while the agent is thinking
+- Automatic message splitting (2000-char Discord limit)
+- File attachment support (images, documents)
+- Bot mention stripping for cleaner input
+- Safe mentions (prevents accidental @everyone/@here pings)
 
 </details>
 
@@ -452,7 +461,7 @@ PRs welcome! The codebase is intentionally small and readable. 🤗
 - [ ] **Multi-modal** — See and hear (images, voice, video)
 - [ ] **Long-term memory** — Never forget important context
 - [ ] **Better reasoning** — Multi-step planning and reflection
-- [ ] **More integrations** — Discord, Slack, email, calendar
+- [ ] **More integrations** — Slack, email, calendar
 - [ ] **Self-improvement** — Learn from feedback and mistakes
 
 ### Contributors
