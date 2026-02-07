@@ -134,10 +134,15 @@ class WebFetchTool(Tool):
                 text, extractor = json.dumps(r.json(), indent=2), "json"
             # HTML
             elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
-                doc = Document(r.text)
-                content = self._to_markdown(doc.summary()) if extractMode == "markdown" else _strip_tags(doc.summary())
-                text = f"# {doc.title()}\n\n{content}" if doc.title() else content
-                extractor = "readability"
+                try:
+                    doc = Document(r.text)
+                    content = self._to_markdown(doc.summary()) if extractMode == "markdown" else _strip_tags(doc.summary())
+                    text = f"# {doc.title()}\n\n{content}" if doc.title() else content
+                    extractor = "readability"
+                except Exception:
+                    # Readability can fail on empty/malformed HTML documents
+                    text = _normalize(_strip_tags(r.text))
+                    extractor = "fallback"
             else:
                 text, extractor = r.text, "raw"
             

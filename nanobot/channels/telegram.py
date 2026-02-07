@@ -5,12 +5,20 @@ import re
 
 from loguru import logger
 from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import TelegramConfig
+
+# Telegram maximum message length
+TELEGRAM_MAX_LENGTH = 4096
+
+# Polling retry config
+MAX_RETRIES = 5
+INITIAL_BACKOFF_S = 1
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -76,11 +84,46 @@ def _markdown_to_telegram_html(text: str) -> str:
     return text
 
 
+def _split_message(text: str, limit: int = TELEGRAM_MAX_LENGTH) -> list[str]:
+    """Split a long message into chunks that fit within Telegram's limit.
+
+    Tries to break on paragraph boundaries first, then on newlines, and
+    finally hard-cuts if necessary.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+
+        # Try to find a natural break point
+        slice_ = remaining[:limit]
+        # Prefer paragraph boundary
+        break_at = slice_.rfind("\n\n")
+        if break_at < limit // 3:
+            # Fall back to single newline
+            break_at = slice_.rfind("\n")
+        if break_at < limit // 3:
+            # Hard cut at limit
+            break_at = limit
+
+        chunks.append(remaining[:break_at].rstrip())
+        remaining = remaining[break_at:].lstrip()
+
+    return chunks
+
+
 class TelegramChannel(BaseChannel):
     """
     Telegram channel using long polling.
     
     Simple and reliable - no webhook/public IP needed.
+    Includes automatic retry with exponential backoff if polling fails.
     """
     
     name = "telegram"
@@ -92,93 +135,158 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
     
-    async def start(self) -> None:
-        """Start the Telegram bot with long polling."""
-        if not self.config.token:
-            logger.error("Telegram bot token not configured")
-            return
-        
-        self._running = True
-        
-        # Build the application
-        self._app = (
+    def _build_app(self) -> Application:
+        """Create a fresh Application instance."""
+        app = (
             Application.builder()
             .token(self.config.token)
             .build()
         )
-        
         # Add message handler for text, photos, voice, documents
-        self._app.add_handler(
+        app.add_handler(
             MessageHandler(
                 (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL) 
                 & ~filters.COMMAND, 
                 self._on_message
             )
         )
-        
         # Add /start command handler
         from telegram.ext import CommandHandler
-        self._app.add_handler(CommandHandler("start", self._on_start))
+        app.add_handler(CommandHandler("start", self._on_start))
+        return app
+
+    async def start(self) -> None:
+        """Start the Telegram bot with long polling and automatic retry."""
+        if not self.config.token:
+            logger.error("Telegram bot token not configured")
+            return
         
-        logger.info("Starting Telegram bot (polling mode)...")
-        
-        # Initialize and start polling
-        await self._app.initialize()
-        await self._app.start()
-        
-        # Get bot info
-        bot_info = await self._app.bot.get_me()
-        logger.info(f"Telegram bot @{bot_info.username} connected")
-        
-        # Start polling (this runs until stopped)
-        await self._app.updater.start_polling(
-            allowed_updates=["message"],
-            drop_pending_updates=True  # Ignore old messages on startup
-        )
-        
-        # Keep running until stopped
-        while self._running:
-            await asyncio.sleep(1)
-    
+        self._running = True
+        retries = 0
+        backoff = INITIAL_BACKOFF_S
+
+        while self._running and retries <= MAX_RETRIES:
+            try:
+                # Build a fresh application each attempt
+                self._app = self._build_app()
+                await self._app.initialize()
+                await self._app.start()
+
+                bot_info = await self._app.bot.get_me()
+                logger.info(f"Telegram bot @{bot_info.username} connected")
+
+                # Start polling as a task so we can monitor it
+                polling_task = asyncio.ensure_future(
+                    self._app.updater.start_polling(
+                        allowed_updates=["message"],
+                        drop_pending_updates=True,
+                    )
+                )
+
+                logger.info("Telegram polling started successfully")
+                retries = 0  # reset on success
+                backoff = INITIAL_BACKOFF_S
+
+                # Monitor polling -- if it dies, break out to retry
+                while self._running:
+                    if polling_task.done():
+                        exc = polling_task.exception()
+                        if exc:
+                            raise exc
+                        # Task finished without error -- unexpected, retry
+                        logger.warning("Telegram polling task exited unexpectedly")
+                        break
+                    await asyncio.sleep(1)
+
+            except Conflict:
+                logger.error(
+                    "Telegram Conflict: another bot instance is running. "
+                    "Kill other processes or remove the webhook: "
+                    "curl https://api.telegram.org/bot<TOKEN>/deleteWebhook"
+                )
+                retries += 1
+            except Exception as e:
+                logger.error(f"Telegram polling error: {e}")
+                retries += 1
+            finally:
+                await self._cleanup_app()
+
+            if self._running and retries <= MAX_RETRIES:
+                logger.info(f"Retrying Telegram connection in {backoff}s (attempt {retries}/{MAX_RETRIES})...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+
+        if retries > MAX_RETRIES:
+            logger.error(
+                f"Telegram: max retries ({MAX_RETRIES}) reached. Troubleshooting:\n"
+                "  1. Kill other bot processes: pkill -f 'python.*nanobot'\n"
+                "  2. Check Docker: docker ps | grep telegram\n"
+                "  3. Delete webhook: curl https://api.telegram.org/bot<TOKEN>/deleteWebhook"
+            )
+
+    async def _cleanup_app(self) -> None:
+        """Safely tear down the current Application instance."""
+        if not self._app:
+            return
+        try:
+            if self._app.updater and self._app.updater.running:
+                await self._app.updater.stop()
+            await self._app.stop()
+            await self._app.shutdown()
+        except Exception as e:
+            logger.debug(f"Telegram cleanup error (ignored): {e}")
+        finally:
+            self._app = None
+
     async def stop(self) -> None:
         """Stop the Telegram bot."""
         self._running = False
-        
-        if self._app:
-            logger.info("Stopping Telegram bot...")
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
-            self._app = None
+        await self._cleanup_app()
     
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Telegram."""
+        """Send a message through Telegram, splitting if it exceeds the limit."""
         if not self._app:
             logger.warning("Telegram bot not running")
             return
         
         try:
-            # chat_id should be the Telegram chat ID (integer)
             chat_id = int(msg.chat_id)
-            # Convert markdown to Telegram HTML
             html_content = _markdown_to_telegram_html(msg.content)
-            await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=html_content,
-                parse_mode="HTML"
-            )
+            chunks = _split_message(html_content)
+
+            if len(chunks) > 1:
+                logger.info(
+                    f"Telegram message too long ({len(html_content)} chars), "
+                    f"splitting into {len(chunks)} parts"
+                )
+
+            for i, chunk in enumerate(chunks, 1):
+                try:
+                    await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=chunk,
+                        parse_mode="HTML",
+                    )
+                except Exception as html_err:
+                    # If HTML formatting fails, try plain text
+                    if "parse" in str(html_err).lower() or "can't" in str(html_err).lower():
+                        logger.warning(f"HTML parse failed for chunk {i}, falling back to plain text")
+                        plain_chunks = _split_message(msg.content)
+                        plain_chunk = plain_chunks[i - 1] if i <= len(plain_chunks) else chunk
+                        try:
+                            await self._app.bot.send_message(
+                                chat_id=chat_id,
+                                text=plain_chunk,
+                            )
+                        except Exception as plain_err:
+                            logger.error(f"Failed to send Telegram chunk {i}/{len(chunks)}: {plain_err}")
+                    else:
+                        raise
+
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
         except Exception as e:
-            # Fallback to plain text if HTML parsing fails
-            logger.warning(f"HTML parse failed, falling back to plain text: {e}")
-            try:
-                await self._app.bot.send_message(
-                    chat_id=int(msg.chat_id),
-                    text=msg.content
-                )
-            except Exception as e2:
-                logger.error(f"Error sending Telegram message: {e2}")
+            logger.error(f"Failed to send Telegram message: {e}")
     
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
@@ -241,11 +349,8 @@ class TelegramChannel(BaseChannel):
                 file = await self._app.bot.get_file(media_file.file_id)
                 ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
                 
-                # Save to workspace/media/
-                from pathlib import Path
-                media_dir = Path.home() / ".nanobot" / "media"
-                media_dir.mkdir(parents=True, exist_ok=True)
-                
+                # Save to shared media directory
+                media_dir = self._get_media_dir()
                 file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
                 await file.download_to_drive(str(file_path))
                 

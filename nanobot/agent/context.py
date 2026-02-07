@@ -31,12 +31,18 @@ class ContextBuilder:
         self._bootstrap_cache: str | None = None
         self._bootstrap_mtimes: dict[str, float] = {}
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        query: str | None = None,
+    ) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
         
         Args:
             skill_names: Optional list of skills to include.
+            query: The user's current message (used for relevance-based
+                memory retrieval via FTS).
         
         Returns:
             Complete system prompt.
@@ -51,8 +57,8 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
         
-        # Memory context
-        memory = self.memory.get_memory_context()
+        # Memory context (FTS-powered when query is provided)
+        memory = self.memory.get_memory_context(query=query)
         if memory:
             parts.append(f"# Memory\n\n{memory}")
         
@@ -207,8 +213,8 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         """
         messages = []
 
-        # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
+        # System prompt (pass current_message for FTS-based memory retrieval)
+        system_prompt = self.build_system_prompt(skill_names, query=current_message)
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
         messages.append({"role": "system", "content": system_prompt})
