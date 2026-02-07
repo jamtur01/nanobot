@@ -14,6 +14,7 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
+import { rmSync } from 'fs';
 
 const VERSION = '0.1.0';
 
@@ -38,6 +39,10 @@ export class WhatsAppClient {
   private reconnecting = false;
   /** IDs of messages we sent, so we can skip our own outbound echoes */
   private sentMessageIds = new Set<string>();
+  /** Cache of LID user → phone user for resolving opaque LIDs */
+  private lidToPhone = new Map<string, string>();
+  /** Auth state reference for accessing LID mappings */
+  private authState: any = null;
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
@@ -46,9 +51,13 @@ export class WhatsAppClient {
   async connect(): Promise<void> {
     const logger = pino({ level: 'silent' });
     const { state, saveCreds } = await useMultiFileAuthState(this.options.authDir);
+    this.authState = state;
     const { version } = await fetchLatestBaileysVersion();
 
     console.log(`Using Baileys version: ${version.join('.')}`);
+
+    // Seed LID→phone mapping from our own credentials
+    this._seedOwnLIDMapping(state.creds);
 
     // Create socket following OpenClaw's pattern
     this.sock = makeWASocket({
@@ -76,26 +85,36 @@ export class WhatsAppClient {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // Display QR code in terminal
+        // Display QR code in terminal for interactive login
         console.log('\n📱 Scan this QR code with WhatsApp (Linked Devices):\n');
-        qrcode.generate(qr, { small: true });
+        (qrcode as any).generate(qr, { small: true }, (code: string) => {
+          console.log(code);
+        });
         this.options.onQR(qr);
       }
 
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
-        console.log(`Connection closed. Status: ${statusCode}, Will reconnect: ${shouldReconnect}`);
+        console.log(`Connection closed. Status: ${statusCode}, Logged out: ${isLoggedOut}`);
         this.options.onStatus('disconnected');
 
-        if (shouldReconnect && !this.reconnecting) {
+        if (!this.reconnecting) {
           this.reconnecting = true;
-          console.log('Reconnecting in 5 seconds...');
+
+          if (isLoggedOut) {
+            // Clear stale auth so Baileys generates a fresh QR on reconnect
+            console.log('Session expired — clearing auth for fresh QR...');
+            try { rmSync(this.options.authDir, { recursive: true, force: true }); } catch {}
+          }
+
+          const delay = isLoggedOut ? 1 : 5;
+          console.log(`Reconnecting in ${delay}s...`);
           setTimeout(() => {
             this.reconnecting = false;
             this.connect();
-          }, 5000);
+          }, delay * 1000);
         }
       } else if (connection === 'open') {
         console.log('✅ Connected to WhatsApp');
@@ -123,11 +142,9 @@ export class WhatsAppClient {
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
 
-        // Prefer the phone-number JID (remoteJidAlt / @s.whatsapp.net)
-        // over the opaque LID (@lid) so allowFrom lists work with phone
-        // numbers.  Fall back to remoteJid if no alt is available.
-        const sender: string =
-          (msg.key as any).remoteJidAlt || msg.key.remoteJid || '';
+        // Resolve LID to phone-number JID so allowFrom lists work
+        const rawJid: string = msg.key.remoteJid || '';
+        const sender = this._resolveToPhoneJid(rawJid);
 
         this.options.onMessage({
           id: msg.key.id || '',
@@ -138,6 +155,67 @@ export class WhatsAppClient {
         });
       }
     });
+  }
+
+  /**
+   * Seed the LID→phone cache from our own credentials.
+   * creds.me has { id: "15037348571:24@s.whatsapp.net", lid: "194506284601577:24@lid" }
+   */
+  private _seedOwnLIDMapping(creds: any): void {
+    const me = creds?.me;
+    if (!me?.id || !me?.lid) return;
+
+    const phoneUser = me.id.split(':')[0].split('@')[0];
+    const lidUser = me.lid.split(':')[0].split('@')[0];
+
+    if (phoneUser && lidUser) {
+      this.lidToPhone.set(lidUser, phoneUser);
+      console.log(`LID mapping: ${lidUser}@lid → ${phoneUser}@s.whatsapp.net`);
+    }
+
+    // Also try to load stored reverse mappings from the auth keys
+    this._loadStoredMappings();
+  }
+
+  /**
+   * Load LID→phone mappings stored by Baileys in the auth state.
+   */
+  private async _loadStoredMappings(): Promise<void> {
+    try {
+      const keys = this.authState?.keys;
+      if (!keys?.get) return;
+
+      // Baileys stores lid-mapping entries; reverse entries have _reverse suffix
+      const stored = await keys.get('lid-mapping', []);
+      if (stored && typeof stored === 'object') {
+        for (const [key, value] of Object.entries(stored)) {
+          if (key.endsWith('_reverse') && typeof value === 'string') {
+            const lidUser = key.replace('_reverse', '');
+            this.lidToPhone.set(lidUser, value);
+          }
+        }
+      }
+    } catch {
+      // Silently ignore - mapping will fall back to raw JID
+    }
+  }
+
+  /**
+   * Resolve a JID, converting @lid JIDs to @s.whatsapp.net when possible.
+   */
+  private _resolveToPhoneJid(jid: string): string {
+    if (!jid.endsWith('@lid')) return jid;
+
+    const lidUser = jid.split(':')[0].split('@')[0];
+    const phoneUser = this.lidToPhone.get(lidUser);
+
+    if (phoneUser) {
+      return `${phoneUser}@s.whatsapp.net`;
+    }
+
+    // Unknown LID — return as-is
+    console.log(`Warning: unresolved LID ${jid}`);
+    return jid;
   }
 
   private extractMessageContent(msg: any): string | null {

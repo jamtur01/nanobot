@@ -97,6 +97,7 @@ class WhatsAppChannel(BaseChannel):
             return
         
         msg_type = data.get("type")
+        logger.debug(f"Bridge event: {msg_type} — {raw[:200]}")
         
         if msg_type == "message":
             # Incoming message from WhatsApp
@@ -111,6 +112,8 @@ class WhatsAppChannel(BaseChannel):
             if content == "[Voice Message]":
                 logger.info(f"Voice message received from {chat_id}, but direct download from bridge is not yet supported.")
                 content = "[Voice Message: Transcription not available for WhatsApp yet]"
+            
+            logger.debug(f"WhatsApp message from sender={sender}, chat_id={chat_id}, content={content[:50]}")
             
             await self._handle_message(
                 sender_id=chat_id,

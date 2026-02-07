@@ -232,6 +232,10 @@ class AgentLoop:
     async def _run_agent_loop(self, messages: list[dict[str, Any]]) -> str | None:
         """Run the LLM tool-call loop. Returns final text content or None."""
         empty_retries_left = EMPTY_RESPONSE_RETRIES
+        # Track whether the last iteration used a delivery tool (message/spawn)
+        # so we can treat a subsequent empty response as intentional completion.
+        last_used_delivery_tool = False
+
         for iteration in range(1, self.max_iterations + 1):
             response = await self.provider.chat(
                 messages=messages,
@@ -239,6 +243,10 @@ class AgentLoop:
                 model=self.model,
             )
             if response.has_tool_calls:
+                tool_names = [tc.name for tc in response.tool_calls]
+                last_used_delivery_tool = any(
+                    n in ("message", "spawn") for n in tool_names
+                )
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -271,6 +279,15 @@ class AgentLoop:
             elif response.content:
                 return response.content
             else:
+                # LLM returned empty.  If the last iteration already
+                # delivered a message to the user, that's a valid
+                # completion — no need to retry or send a fallback.
+                if last_used_delivery_tool:
+                    logger.debug(
+                        "LLM returned empty after delivery tool — "
+                        "treating as successful completion"
+                    )
+                    return None
                 if empty_retries_left > 0:
                     empty_retries_left -= 1
                     retry_num = EMPTY_RESPONSE_RETRIES - empty_retries_left
@@ -306,11 +323,11 @@ class AgentLoop:
         
         final_content = await self._run_agent_loop(messages)
         
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-        
+        # Save conversation history regardless of whether we got a text reply
+        assistant_text = final_content or ""
         session.add_message("user", msg.content)
-        session.add_message("assistant", final_content)
+        if assistant_text:
+            session.add_message("assistant", assistant_text)
         self.sessions.save(session)
         
         # Background fact extraction (fire and forget)
@@ -318,10 +335,16 @@ class AgentLoop:
             self._compactor
             and self.compaction_config.extraction_enabled
             and msg.channel != "system"
+            and assistant_text
         ):
             asyncio.create_task(
-                self._extract_and_save_facts(msg.content, final_content)
+                self._extract_and_save_facts(msg.content, assistant_text)
             )
+        
+        # If the agent already delivered via the message tool, don't
+        # send an additional outbound message (would be a duplicate).
+        if final_content is None:
+            return None
         
         return OutboundMessage(
             channel=msg.channel,

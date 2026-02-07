@@ -274,6 +274,11 @@ def gateway(
         cooldown_after_action=daemon_cfg.cooldown_after_action,
     )
     
+    # Auto-start the WhatsApp bridge subprocess if enabled
+    bridge_proc = None
+    if config.channels.whatsapp.enabled:
+        bridge_proc = _start_bridge_subprocess()
+
     # Create channel manager
     channels = ChannelManager(config, bus)
     
@@ -308,6 +313,10 @@ def gateway(
             cron.stop()
             agent.stop()
             await channels.stop_all()
+        finally:
+            if bridge_proc and bridge_proc.poll() is None:
+                bridge_proc.terminate()
+                bridge_proc.wait(timeout=5)
     
     asyncio.run(run())
 
@@ -587,6 +596,69 @@ def _get_bridge_dir() -> Path:
         raise typer.Exit(1)
     
     return user_bridge
+
+
+def _start_bridge_subprocess():
+    """Launch the WhatsApp Node.js bridge as a background subprocess."""
+    import subprocess
+    import shutil
+
+    if not shutil.which("node"):
+        logger.warning("node not found — WhatsApp bridge will not start")
+        return None
+
+    try:
+        bridge_dir = _get_bridge_dir()
+    except (SystemExit, typer.Exit):
+        logger.warning("WhatsApp bridge could not be set up")
+        return None
+
+    entry = bridge_dir / "dist" / "index.js"
+    if not entry.exists():
+        logger.warning("WhatsApp bridge not built — run 'nanobot channels login' first")
+        return None
+
+    logger.info(f"Starting WhatsApp bridge subprocess from {entry}")
+    proc = subprocess.Popen(
+        ["node", str(entry)],
+        cwd=str(bridge_dir),
+        # Let bridge output flow to the parent's stderr (visible in systemd journal)
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    # Give the bridge a moment to start its WebSocket server
+    import time
+    time.sleep(3)
+    if proc.poll() is not None:
+        output = proc.stdout.read().decode()[:500] if proc.stdout else ""
+        logger.error(f"WhatsApp bridge exited immediately: {output}")
+        return None
+
+    logger.info(f"WhatsApp bridge subprocess started (PID {proc.pid})")
+
+    # Drain bridge stdout in a background thread so the pipe buffer
+    # doesn't fill up and block the bridge process
+    import threading
+    def _drain():
+        suppressing = False
+        for line in proc.stdout:
+            text = line.decode(errors='replace').rstrip()
+            if not text:
+                continue
+            # Baileys dumps multi-line Signal session objects starting
+            # with "Closing session:" — suppress until the closing "}"
+            if 'Closing session' in text or 'SessionEntry' in text:
+                suppressing = True
+                continue
+            if suppressing:
+                if text.strip() == '}' and not text.startswith(' '):
+                    suppressing = False
+                continue
+            logger.debug(f"[bridge] {text}")
+    threading.Thread(target=_drain, daemon=True).start()
+
+    return proc
 
 
 @channels_app.command("login")
