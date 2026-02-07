@@ -84,38 +84,6 @@ def _markdown_to_telegram_html(text: str) -> str:
     return text
 
 
-def _split_message(text: str, limit: int = TELEGRAM_MAX_LENGTH) -> list[str]:
-    """Split a long message into chunks that fit within Telegram's limit.
-
-    Tries to break on paragraph boundaries first, then on newlines, and
-    finally hard-cuts if necessary.
-    """
-    if len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    remaining = text
-
-    while remaining:
-        if len(remaining) <= limit:
-            chunks.append(remaining)
-            break
-
-        # Try to find a natural break point
-        slice_ = remaining[:limit]
-        # Prefer paragraph boundary
-        break_at = slice_.rfind("\n\n")
-        if break_at < limit // 3:
-            # Fall back to single newline
-            break_at = slice_.rfind("\n")
-        if break_at < limit // 3:
-            # Hard cut at limit
-            break_at = limit
-
-        chunks.append(remaining[:break_at].rstrip())
-        remaining = remaining[break_at:].lstrip()
-
-    return chunks
 
 
 class TelegramChannel(BaseChannel):
@@ -248,7 +216,7 @@ class TelegramChannel(BaseChannel):
         try:
             chat_id = int(msg.chat_id)
             html_content = _markdown_to_telegram_html(msg.content)
-            chunks = _split_message(html_content)
+            chunks = self.split_message(html_content, TELEGRAM_MAX_LENGTH)
 
             if len(chunks) > 1:
                 logger.info(
@@ -264,15 +232,14 @@ class TelegramChannel(BaseChannel):
                         parse_mode="HTML",
                     )
                 except Exception as html_err:
-                    # If HTML formatting fails, try plain text
+                    # If HTML formatting fails, strip tags and retry as plain text
                     if "parse" in str(html_err).lower() or "can't" in str(html_err).lower():
                         logger.warning(f"HTML parse failed for chunk {i}, falling back to plain text")
-                        plain_chunks = _split_message(msg.content)
-                        plain_chunk = plain_chunks[i - 1] if i <= len(plain_chunks) else chunk
+                        plain = re.sub(r"<[^>]+>", "", chunk)
                         try:
                             await self._app.bot.send_message(
                                 chat_id=chat_id,
-                                text=plain_chunk,
+                                text=plain,
                             )
                         except Exception as plain_err:
                             logger.error(f"Failed to send Telegram chunk {i}/{len(chunks)}: {plain_err}")

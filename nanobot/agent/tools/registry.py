@@ -19,17 +19,9 @@ class ToolRegistry:
         """Register a tool."""
         self._tools[tool.name] = tool
     
-    def unregister(self, name: str) -> None:
-        """Unregister a tool by name."""
-        self._tools.pop(name, None)
-    
     def get(self, name: str) -> Tool | None:
         """Get a tool by name."""
         return self._tools.get(name)
-    
-    def has(self, name: str) -> bool:
-        """Check if a tool is registered."""
-        return name in self._tools
     
     def get_definitions(self) -> list[dict[str, Any]]:
         """Get all tool definitions in OpenAI format."""

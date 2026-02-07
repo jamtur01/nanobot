@@ -3,14 +3,12 @@
 import asyncio
 import json
 import random
-import re
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-# Tool result truncation limit (~3KB)
-MAX_TOOL_RESULT_CHARS = 3000
+from nanobot.agent.truncation import truncate_tool_result
 
 # Empty LLM response retry config
 EMPTY_RESPONSE_RETRIES = 2
@@ -170,45 +168,6 @@ class AgentLoop:
                 f"Install with: pip install nanobot-ai[google]  ({e})"
             )
 
-    @staticmethod
-    def _truncate_tool_result(result: str) -> str:
-        """Truncate a single tool result to keep context lean.
-
-        Strips ANSI escape codes, then applies format-aware truncation:
-        - JSON is pretty-printed and prefix-truncated so visible output is valid syntax.
-        - Plain text uses head truncation with a clear sentinel.
-        """
-        # Strip ANSI escape sequences
-        clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', result)
-
-        if len(clean) <= MAX_TOOL_RESULT_CHARS:
-            return clean
-
-        # Detect JSON and handle without breaking syntax
-        stripped = clean.lstrip()
-        if stripped and stripped[0] in ('{', '['):
-            try:
-                parsed = json.loads(clean)
-                pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
-                if len(pretty) <= MAX_TOOL_RESULT_CHARS:
-                    return pretty
-                budget = MAX_TOOL_RESULT_CHARS - 120
-                return (
-                    pretty[:budget]
-                    + f"\n\n... [JSON truncated - showed {budget} of {len(pretty)} chars. "
-                    + "Do NOT re-run this tool to see more.]"
-                )
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        # Plain text: head truncation with sentinel
-        budget = MAX_TOOL_RESULT_CHARS - 100
-        return (
-            clean[:budget]
-            + f"\n\n... [truncated - showed {budget} of {len(clean)} chars. "
-            + "Do NOT re-run this tool to see more.]"
-        )
-
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
@@ -258,69 +217,36 @@ class AgentLoop:
         async with self._processing_lock:
             return await self._process_message_unlocked(msg)
 
-    async def _process_message_unlocked(self, msg: InboundMessage) -> OutboundMessage | None:
-        """Inner message processing (called under lock)."""
-        # Handle system messages (subagent announces)
-        # The chat_id contains the original "channel:chat_id" to route back to
-        if msg.channel == "system":
-            return await self._process_system_message(msg)
-        
-        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
-        
-        # Get or create session
-        session = self.sessions.get_or_create(msg.session_key)
-        
-        # Update tool contexts
+    def _set_tool_contexts(self, channel: str, chat_id: str) -> None:
+        """Update channel/chat context on context-aware tools."""
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
-            message_tool.set_context(msg.channel, msg.chat_id)
-        
+            message_tool.set_context(channel, chat_id)
         spawn_tool = self.tools.get("spawn")
         if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(msg.channel, msg.chat_id)
-        
+            spawn_tool.set_context(channel, chat_id)
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(msg.channel, msg.chat_id)
-        
-        # Get history, applying compaction if needed
-        history = await self._get_compacted_history(session)
-        
-        # Build initial messages
-        messages = self.context.build_messages(
-            history=history,
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-        )
-        
-        # Agent loop
-        iteration = 0
-        final_content = None
+            cron_tool.set_context(channel, chat_id)
+
+    async def _run_agent_loop(self, messages: list[dict[str, Any]]) -> str | None:
+        """Run the LLM tool-call loop. Returns final text content or None."""
         empty_retries_left = EMPTY_RESPONSE_RETRIES
-        
-        while iteration < self.max_iterations:
-            iteration += 1
-            
-            # Call LLM
+        for iteration in range(1, self.max_iterations + 1):
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model
+                model=self.model,
             )
-            
-            # Handle tool calls
             if response.has_tool_calls:
-                # Add assistant message with tool calls
                 tool_call_dicts = [
                     {
                         "id": tc.id,
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)  # Must be JSON string
-                        }
+                            "arguments": json.dumps(tc.arguments),
+                        },
                     }
                     for tc in response.tool_calls
                 ]
@@ -330,22 +256,21 @@ class AgentLoop:
                     tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                 )
-                
-                # Execute tools (truncate results to keep context lean)
                 for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments)
-                    logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    raw_result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    result = self._truncate_tool_result(raw_result)
+                    logger.debug(
+                        f"Executing tool: {tool_call.name} "
+                        f"with arguments: {json.dumps(tool_call.arguments)}"
+                    )
+                    raw_result = await self.tools.execute(
+                        tool_call.name, tool_call.arguments
+                    )
+                    result = truncate_tool_result(raw_result)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
             elif response.content:
-                # No tool calls, we're done
-                final_content = response.content
-                break
+                return response.content
             else:
-                # LLM returned empty: retry with exponential backoff + jitter
                 if empty_retries_left > 0:
                     empty_retries_left -= 1
                     retry_num = EMPTY_RESPONSE_RETRIES - empty_retries_left
@@ -358,11 +283,32 @@ class AgentLoop:
                     continue
                 logger.warning("LLM returned empty, no retries left - giving up")
                 break
+        return None
+
+    async def _process_message_unlocked(self, msg: InboundMessage) -> OutboundMessage | None:
+        """Inner message processing (called under lock)."""
+        if msg.channel == "system":
+            return await self._process_system_message(msg)
+        
+        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
+        
+        session = self.sessions.get_or_create(msg.session_key)
+        self._set_tool_contexts(msg.channel, msg.chat_id)
+        
+        history = await self._get_compacted_history(session)
+        messages = self.context.build_messages(
+            history=history,
+            current_message=msg.content,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+        )
+        
+        final_content = await self._run_agent_loop(messages)
         
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
         
-        # Save to session
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
@@ -474,98 +420,29 @@ class AgentLoop:
             origin_channel = parts[0]
             origin_chat_id = parts[1]
         else:
-            # Fallback
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
         
-        # Use the origin session for context
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
         
         # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(origin_channel, origin_chat_id)
+        self._set_tool_contexts(origin_channel, origin_chat_id)
         
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(origin_channel, origin_chat_id)
-        
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(origin_channel, origin_chat_id)
-        
-        # Build messages with the announce content
+        # Build messages (with compaction)
+        history = await self._get_compacted_history(session)
         messages = self.context.build_messages(
-            history=session.get_history(),
+            history=history,
             current_message=msg.content,
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
         
-        # Agent loop (limited for announce handling)
-        iteration = 0
-        final_content = None
-        empty_retries_left = EMPTY_RESPONSE_RETRIES
-        
-        while iteration < self.max_iterations:
-            iteration += 1
-            
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model
-            )
-            
-            if response.has_tool_calls:
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages,
-                    response.content,
-                    tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                )
-                
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments)
-                    logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    raw_result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    result = self._truncate_tool_result(raw_result)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-            elif response.content:
-                final_content = response.content
-                break
-            else:
-                # Exponential backoff + jitter on empty response
-                if empty_retries_left > 0:
-                    empty_retries_left -= 1
-                    retry_num = EMPTY_RESPONSE_RETRIES - empty_retries_left
-                    delay = min(2 ** retry_num + random.uniform(0, 1), 10.0)
-                    logger.warning(
-                        f"LLM returned empty on iteration {iteration} (system), "
-                        f"retries left: {empty_retries_left}, backing off {delay:.1f}s"
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                logger.warning("LLM returned empty (system), no retries left - giving up")
-                break
+        final_content = await self._run_agent_loop(messages)
         
         if final_content is None:
             final_content = "Background task completed."
         
-        # Save to session (mark as system message in history)
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
         self.sessions.save(session)

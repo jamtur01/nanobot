@@ -87,6 +87,35 @@ class BaseChannel(ABC):
         return False
     
     # ------------------------------------------------------------------
+    # Text helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def split_message(text: str, limit: int = 2000) -> list[str]:
+        """Split a long message into chunks that fit within *limit* chars.
+
+        Tries paragraph boundaries first, then single newlines, then hard-cuts.
+        """
+        if len(text) <= limit:
+            return [text]
+
+        chunks: list[str] = []
+        remaining = text
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
+            slice_ = remaining[:limit]
+            break_at = slice_.rfind("\n\n")
+            if break_at < limit // 3:
+                break_at = slice_.rfind("\n")
+            if break_at < limit // 3:
+                break_at = limit
+            chunks.append(remaining[:break_at].rstrip())
+            remaining = remaining[break_at:].lstrip("\n")
+        return chunks
+
+    # ------------------------------------------------------------------
     # Media helpers
     # ------------------------------------------------------------------
 

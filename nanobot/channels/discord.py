@@ -17,19 +17,12 @@ _SAFE_MENTIONS = discord.AllowedMentions.none()
 
 
 def _markdown_to_discord(text: str) -> str:
-    """
-    Clean up markdown for Discord.
+    """Clean up markdown for Discord.
 
-    Discord natively supports most markdown, so this is light-touch:
-    just ensure code blocks and formatting pass through cleanly,
-    and cap message length at Discord's 2000-char limit.
+    Discord natively supports most markdown, so this is light-touch.
+    Length is handled by _split_message, not here.
     """
-    if not text:
-        return ""
-    # Discord has a 2000-char limit per message; truncate with notice
-    if len(text) > 1990:
-        text = text[:1990] + "\n…(truncated)"
-    return text
+    return text or ""
 
 
 class DiscordChannel(BaseChannel):
@@ -126,7 +119,7 @@ class DiscordChannel(BaseChannel):
             # Collect any file attachments from outbound media paths
             files = _build_files(msg.media) if msg.media else []
 
-            chunks = _split_message(content)
+            chunks = self.split_message(content)
             reply_msg = self._pending_replies.pop(msg.chat_id, None)
 
             for i, chunk in enumerate(chunks):
@@ -286,23 +279,6 @@ def _ext_from_content_type(content_type: str) -> str:
     return ext_map.get(content_type, ".bin")
 
 
-def _split_message(text: str, limit: int = 2000) -> list[str]:
-    """Split a message into chunks that fit Discord's character limit."""
-    if len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    while text:
-        if len(text) <= limit:
-            chunks.append(text)
-            break
-        # Try to split at a newline
-        split_at = text.rfind("\n", 0, limit)
-        if split_at == -1:
-            split_at = limit
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    return chunks
 
 
 def _build_files(media_paths: list[str]) -> list[discord.File]:

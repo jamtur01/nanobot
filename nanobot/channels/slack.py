@@ -103,7 +103,7 @@ class SlackChannel(BaseChannel):
             content = _format_for_slack(msg.content)
 
             # Split long messages (Slack limit is ~40k but 4000 is more readable)
-            for chunk in _split_message(content, limit=4000):
+            for chunk in self.split_message(content, limit=4000):
                 await self._web_client.chat_postMessage(
                     channel=msg.chat_id,
                     text=chunk,
@@ -233,19 +233,3 @@ def _ext_from_mimetype(mimetype: str) -> str:
     }.get(mimetype, ".bin")
 
 
-def _split_message(text: str, limit: int = 4000) -> list[str]:
-    """Split a message into chunks that fit Slack's limits."""
-    if len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    while text:
-        if len(text) <= limit:
-            chunks.append(text)
-            break
-        split_at = text.rfind("\n", 0, limit)
-        if split_at == -1:
-            split_at = limit
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    return chunks

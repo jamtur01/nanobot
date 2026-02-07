@@ -3,12 +3,13 @@
 import asyncio
 import json
 import random
-import re
 import uuid
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+from nanobot.agent.truncation import truncate_tool_result
 
 # Subagent tool result limit (~2KB)
 _MAX_TOOL_RESULT_CHARS = 2000
@@ -54,40 +55,6 @@ class SubagentManager:
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
     
-    @staticmethod
-    def _truncate_result(result: str) -> str:
-        """Truncate tool result for subagent context.
-
-        Content-type-aware: JSON is prefix-truncated so the visible
-        portion remains valid syntax; plain text uses head truncation.
-        """
-        clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', result)
-        if len(clean) <= _MAX_TOOL_RESULT_CHARS:
-            return clean
-
-        stripped = clean.lstrip()
-        if stripped and stripped[0] in ('{', '['):
-            try:
-                parsed = json.loads(clean)
-                pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
-                if len(pretty) <= _MAX_TOOL_RESULT_CHARS:
-                    return pretty
-                budget = _MAX_TOOL_RESULT_CHARS - 100
-                return (
-                    pretty[:budget]
-                    + f"\n\n... [JSON truncated - showed {budget} of {len(pretty)} chars. "
-                    + "Do NOT re-run this tool to see more.]"
-                )
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        budget = _MAX_TOOL_RESULT_CHARS - 80
-        return (
-            clean[:budget]
-            + f"\n\n... [truncated - showed {budget} of {len(clean)} chars. "
-            + "Do NOT re-run this tool to see more.]"
-        )
-
     async def spawn(
         self,
         task: str,
@@ -205,7 +172,7 @@ class SubagentManager:
                         args_str = json.dumps(tool_call.arguments)
                         logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
                         raw_result = await tools.execute(tool_call.name, tool_call.arguments)
-                        result = self._truncate_result(raw_result)
+                        result = truncate_tool_result(raw_result, _MAX_TOOL_RESULT_CHARS)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,

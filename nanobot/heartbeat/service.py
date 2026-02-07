@@ -97,10 +97,11 @@ class HeartbeatService:
         enabled: bool = True,
         triage_provider: LLMProvider | None = None,
         triage_model: str | None = None,
-        execution_model: str | None = None,
         strategy_file: str = "HEARTBEAT.md",
-        max_iterations: int = 25,
         cooldown_after_action: int = 600,
+        # Accepted but unused -- kept for config-compat
+        execution_model: str | None = None,
+        max_iterations: int = 25,
     ):
         self.workspace = workspace
         self.on_heartbeat = on_heartbeat
@@ -112,9 +113,7 @@ class HeartbeatService:
         # Daemon mode params
         self._triage_provider = triage_provider
         self._triage_model = triage_model
-        self._execution_model = execution_model
         self._strategy_file = strategy_file
-        self._max_iterations = max_iterations
         self._cooldown_s = cooldown_after_action
         self._last_action_time: float = 0
         self._daemon_mode = triage_provider is not None
