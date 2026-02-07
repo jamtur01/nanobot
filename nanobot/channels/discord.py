@@ -1,12 +1,10 @@
-"""Discord channel implementation using Discord Gateway websocket."""
+"""Discord channel implementation using discord.py."""
 
 import asyncio
-import json
+import re
 from pathlib import Path
-from typing import Any
 
-import httpx
-import websockets
+import discord
 from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
@@ -14,248 +12,307 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import DiscordConfig
 
+# Prevent the bot from accidentally pinging @everyone, @here, roles, or users
+_SAFE_MENTIONS = discord.AllowedMentions.none()
 
-DISCORD_API_BASE = "https://discord.com/api/v10"
-MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
+
+def _markdown_to_discord(text: str) -> str:
+    """
+    Clean up markdown for Discord.
+
+    Discord natively supports most markdown, so this is light-touch:
+    just ensure code blocks and formatting pass through cleanly,
+    and cap message length at Discord's 2000-char limit.
+    """
+    if not text:
+        return ""
+    # Discord has a 2000-char limit per message; truncate with notice
+    if len(text) > 1990:
+        text = text[:1990] + "\n…(truncated)"
+    return text
 
 
 class DiscordChannel(BaseChannel):
-    """Discord channel using Gateway websocket."""
+    """
+    Discord channel using discord.py with gateway intents.
+
+    Listens for DMs and messages in channels where the bot is mentioned
+    or configured to respond.
+    """
 
     name = "discord"
 
     def __init__(self, config: DiscordConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: DiscordConfig = config
-        self._ws: websockets.WebSocketClientProtocol | None = None
-        self._seq: int | None = None
-        self._heartbeat_task: asyncio.Task | None = None
+        self._client: discord.Client | None = None
+        # Map channel/DM id -> discord channel object for sending replies
+        self._channels: dict[str, discord.abc.Messageable] = {}
+        # Map channel/DM id -> last incoming message (for threaded replies)
+        self._pending_replies: dict[str, discord.Message] = {}
+        # Typing context tasks per channel (for cancellation)
         self._typing_tasks: dict[str, asyncio.Task] = {}
-        self._http: httpx.AsyncClient | None = None
 
     async def start(self) -> None:
-        """Start the Discord gateway connection."""
+        """Start the Discord bot."""
         if not self.config.token:
             logger.error("Discord bot token not configured")
             return
 
         self._running = True
-        self._http = httpx.AsyncClient(timeout=30.0)
 
-        while self._running:
-            try:
-                logger.info("Connecting to Discord gateway...")
-                async with websockets.connect(self.config.gateway_url) as ws:
-                    self._ws = ws
-                    await self._gateway_loop()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"Discord gateway error: {e}")
-                if self._running:
-                    logger.info("Reconnecting to Discord gateway in 5 seconds...")
-                    await asyncio.sleep(5)
+        # We need message_content intent to read message text
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.dm_messages = True
+
+        self._client = discord.Client(
+            intents=intents,
+            activity=discord.Activity(
+                type=discord.ActivityType.listening,
+                name="messages",
+            ),
+        )
+
+        @self._client.event
+        async def on_ready() -> None:
+            assert self._client is not None
+            user = self._client.user
+            logger.info(f"Discord bot connected as {user} (ID: {user.id})")  # type: ignore[union-attr]
+
+        @self._client.event
+        async def on_message(message: discord.Message) -> None:
+            await self._on_message(message)
+
+        @self._client.event
+        async def on_error(event: str, *args, **kwargs) -> None:  # type: ignore[override]
+            logger.exception(f"Unhandled Discord error in event '{event}'")
+
+        logger.info("Starting Discord bot...")
+        try:
+            await self._client.start(self.config.token)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Discord bot error: {e}")
+        finally:
+            self._running = False
 
     async def stop(self) -> None:
-        """Stop the Discord channel."""
+        """Stop the Discord bot."""
         self._running = False
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            self._heartbeat_task = None
-        for task in self._typing_tasks.values():
+        for task in list(self._typing_tasks.values()):
             task.cancel()
         self._typing_tasks.clear()
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
-        if self._http:
-            await self._http.aclose()
-            self._http = None
+        self._pending_replies.clear()
+        if self._client and not self._client.is_closed():
+            logger.info("Stopping Discord bot...")
+            await self._client.close()
+            self._client = None
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Discord REST API."""
-        if not self._http:
-            logger.warning("Discord HTTP client not initialized")
+        """Send a message through Discord (discord.py handles rate limits internally)."""
+        if not self._client:
+            logger.warning("Discord bot not running")
             return
-
-        url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
-        payload: dict[str, Any] = {"content": msg.content}
-
-        if msg.reply_to:
-            payload["message_reference"] = {"message_id": msg.reply_to}
-            payload["allowed_mentions"] = {"replied_user": False}
-
-        headers = {"Authorization": f"Bot {self.config.token}"}
 
         try:
-            for attempt in range(3):
+            target = await self._resolve_channel(msg.chat_id)
+            if target is None:
+                return
+
+            content = _markdown_to_discord(msg.content)
+
+            # Collect any file attachments from outbound media paths
+            files = _build_files(msg.media) if msg.media else []
+
+            chunks = _split_message(content)
+            reply_msg = self._pending_replies.pop(msg.chat_id, None)
+
+            for i, chunk in enumerate(chunks):
                 try:
-                    response = await self._http.post(url, headers=headers, json=payload)
-                    if response.status_code == 429:
-                        data = response.json()
-                        retry_after = float(data.get("retry_after", 1.0))
-                        logger.warning(f"Discord rate limited, retrying in {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        continue
-                    response.raise_for_status()
-                    return
-                except Exception as e:
-                    if attempt == 2:
-                        logger.error(f"Error sending Discord message: {e}")
+                    # Reply to the original message for the first chunk
+                    if i == 0 and reply_msg is not None:
+                        await reply_msg.reply(
+                            chunk,
+                            allowed_mentions=_SAFE_MENTIONS,
+                            files=files if i == 0 else [],
+                        )
                     else:
-                        await asyncio.sleep(1)
-        finally:
-            await self._stop_typing(msg.chat_id)
-
-    async def _gateway_loop(self) -> None:
-        """Main gateway loop: identify, heartbeat, dispatch events."""
-        if not self._ws:
-            return
-
-        async for raw in self._ws:
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning(f"Invalid JSON from Discord gateway: {raw[:100]}")
-                continue
-
-            op = data.get("op")
-            event_type = data.get("t")
-            seq = data.get("s")
-            payload = data.get("d")
-
-            if seq is not None:
-                self._seq = seq
-
-            if op == 10:
-                # HELLO: start heartbeat and identify
-                interval_ms = payload.get("heartbeat_interval", 45000)
-                await self._start_heartbeat(interval_ms / 1000)
-                await self._identify()
-            elif op == 0 and event_type == "READY":
-                logger.info("Discord gateway READY")
-            elif op == 0 and event_type == "MESSAGE_CREATE":
-                await self._handle_message_create(payload)
-            elif op == 7:
-                # RECONNECT: exit loop to reconnect
-                logger.info("Discord gateway requested reconnect")
-                break
-            elif op == 9:
-                # INVALID_SESSION: reconnect
-                logger.warning("Discord gateway invalid session")
-                break
-
-    async def _identify(self) -> None:
-        """Send IDENTIFY payload."""
-        if not self._ws:
-            return
-
-        identify = {
-            "op": 2,
-            "d": {
-                "token": self.config.token,
-                "intents": self.config.intents,
-                "properties": {
-                    "os": "nanobot",
-                    "browser": "nanobot",
-                    "device": "nanobot",
-                },
-            },
-        }
-        await self._ws.send(json.dumps(identify))
-
-    async def _start_heartbeat(self, interval_s: float) -> None:
-        """Start or restart the heartbeat loop."""
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-
-        async def heartbeat_loop() -> None:
-            while self._running and self._ws:
-                payload = {"op": 1, "d": self._seq}
-                try:
-                    await self._ws.send(json.dumps(payload))
+                        await target.send(
+                            chunk,
+                            allowed_mentions=_SAFE_MENTIONS,
+                            files=files if i == 0 else [],
+                        )
                 except Exception as e:
-                    logger.warning(f"Discord heartbeat failed: {e}")
-                    break
-                await asyncio.sleep(interval_s)
+                    logger.error(f"Error sending Discord message: {e}")
+        finally:
+            self._stop_typing(msg.chat_id)
 
-        self._heartbeat_task = asyncio.create_task(heartbeat_loop())
+    async def _resolve_channel(self, chat_id: str) -> discord.abc.Messageable | None:
+        """Resolve a chat_id to a messageable Discord channel."""
+        if not self._client:
+            return None
 
-    async def _handle_message_create(self, payload: dict[str, Any]) -> None:
-        """Handle incoming Discord messages."""
-        author = payload.get("author") or {}
-        if author.get("bot"):
-            return
+        channel_id = int(chat_id)
 
-        sender_id = str(author.get("id", ""))
-        channel_id = str(payload.get("channel_id", ""))
-        content = payload.get("content") or ""
-
-        if not sender_id or not channel_id:
-            return
-
-        if not self.is_allowed(sender_id):
-            return
-
-        content_parts = [content] if content else []
-        media_paths: list[str] = []
-        media_dir = Path.home() / ".nanobot" / "media"
-
-        for attachment in payload.get("attachments") or []:
-            url = attachment.get("url")
-            filename = attachment.get("filename") or "attachment"
-            size = attachment.get("size") or 0
-            if not url or not self._http:
-                continue
-            if size and size > MAX_ATTACHMENT_BYTES:
-                content_parts.append(f"[attachment: {filename} - too large]")
-                continue
+        # Try cache first
+        target = self._channels.get(chat_id)
+        if target is None:
+            target = self._client.get_channel(channel_id)
+        if target is None:
+            # Might be a DM — fetch the user and create DM channel
             try:
-                media_dir.mkdir(parents=True, exist_ok=True)
-                file_path = media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
-                resp = await self._http.get(url)
-                resp.raise_for_status()
-                file_path.write_bytes(resp.content)
-                media_paths.append(str(file_path))
-                content_parts.append(f"[attachment: {file_path}]")
-            except Exception as e:
-                logger.warning(f"Failed to download Discord attachment: {e}")
-                content_parts.append(f"[attachment: {filename} - download failed]")
+                user = await self._client.fetch_user(channel_id)
+                target = await user.create_dm()
+            except Exception:
+                logger.error(f"Could not find Discord channel or user for id {channel_id}")
+                return None
 
-        reply_to = (payload.get("referenced_message") or {}).get("id")
+        if not isinstance(target, discord.abc.Messageable):
+            logger.error(f"Discord target {channel_id} is not messageable")
+            return None
 
-        await self._start_typing(channel_id)
+        return target
+
+    async def _on_message(self, message: discord.Message) -> None:
+        """Handle an incoming Discord message."""
+        # Ignore our own messages
+        if self._client and message.author.id == self._client.user.id:  # type: ignore[union-attr]
+            return
+
+        # Determine if we should respond:
+        # 1. Always respond to DMs
+        # 2. In guild channels, respond only if bot is mentioned
+        is_dm = isinstance(message.channel, discord.DMChannel)
+        is_mentioned = self._client is not None and self._client.user in message.mentions  # type: ignore[union-attr]
+
+        if not is_dm and not is_mentioned:
+            return
+
+        # Build sender_id: "user_id|username"
+        sender_id = str(message.author.id)
+        if message.author.name:
+            sender_id = f"{sender_id}|{message.author.name}"
+
+        # Use the channel id as chat_id (works for both DM and guild channels)
+        chat_id = str(message.channel.id)
+
+        # Cache the channel and original message for replies
+        self._channels[chat_id] = message.channel
+        self._pending_replies[chat_id] = message
+
+        # Build content
+        content_parts: list[str] = []
+
+        # Strip the bot mention from the text for cleaner input
+        text = message.content or ""
+        if is_mentioned and self._client and self._client.user:
+            text = re.sub(rf"<@!?{self._client.user.id}>\s*", "", text).strip()
+
+        if text:
+            content_parts.append(text)
+
+        # Handle attachments
+        media_paths: list[str] = []
+        for attachment in message.attachments:
+            if attachment.content_type and attachment.content_type.startswith("image/"):
+                # Download image to local media dir
+                try:
+                    media_dir = Path.home() / ".nanobot" / "media"
+                    media_dir.mkdir(parents=True, exist_ok=True)
+                    ext = _ext_from_content_type(attachment.content_type)
+                    file_path = media_dir / f"discord_{attachment.id}{ext}"
+                    await attachment.save(file_path)
+                    media_paths.append(str(file_path))
+                    content_parts.append(f"[image: {file_path}]")
+                except Exception as e:
+                    logger.error(f"Failed to download Discord attachment: {e}")
+                    content_parts.append(f"[image: download failed]")
+            else:
+                content_parts.append(f"[attachment: {attachment.filename}]")
+
+        content = "\n".join(content_parts) if content_parts else "[empty message]"
+
+        logger.debug(f"Discord message from {sender_id}: {content[:50]}...")
+
+        self._start_typing(chat_id, message.channel)
 
         await self._handle_message(
             sender_id=sender_id,
-            chat_id=channel_id,
-            content="\n".join(p for p in content_parts if p) or "[empty message]",
+            chat_id=chat_id,
+            content=content,
             media=media_paths,
             metadata={
-                "message_id": str(payload.get("id", "")),
-                "guild_id": payload.get("guild_id"),
-                "reply_to": reply_to,
+                "message_id": message.id,
+                "user_id": message.author.id,
+                "username": message.author.name,
+                "guild_id": message.guild.id if message.guild else None,
+                "is_dm": is_dm,
             },
         )
 
-    async def _start_typing(self, channel_id: str) -> None:
-        """Start periodic typing indicator for a channel."""
-        await self._stop_typing(channel_id)
+    def _start_typing(self, chat_id: str, channel: discord.abc.Messageable) -> None:
+        """Start a typing indicator using discord.py's context manager."""
+        self._stop_typing(chat_id)
 
-        async def typing_loop() -> None:
-            url = f"{DISCORD_API_BASE}/channels/{channel_id}/typing"
-            headers = {"Authorization": f"Bot {self.config.token}"}
-            while self._running:
-                try:
-                    await self._http.post(url, headers=headers)
-                except Exception:
-                    pass
-                await asyncio.sleep(8)
+        async def typing_wrapper() -> None:
+            try:
+                async with channel.typing():
+                    # Block until cancelled — the context manager keeps typing active
+                    await asyncio.sleep(600)  # 10 min upper bound
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
 
-        self._typing_tasks[channel_id] = asyncio.create_task(typing_loop())
+        self._typing_tasks[chat_id] = asyncio.create_task(typing_wrapper())
 
-    async def _stop_typing(self, channel_id: str) -> None:
-        """Stop typing indicator for a channel."""
-        task = self._typing_tasks.pop(channel_id, None)
+    def _stop_typing(self, chat_id: str) -> None:
+        """Stop the typing indicator for a channel."""
+        task = self._typing_tasks.pop(chat_id, None)
         if task:
             task.cancel()
+
+
+def _ext_from_content_type(content_type: str) -> str:
+    """Map content type to file extension."""
+    ext_map = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+    }
+    return ext_map.get(content_type, ".bin")
+
+
+def _split_message(text: str, limit: int = 2000) -> list[str]:
+    """Split a message into chunks that fit Discord's character limit."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        # Try to split at a newline
+        split_at = text.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = limit
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
+
+
+def _build_files(media_paths: list[str]) -> list[discord.File]:
+    """Build discord.File objects from local file paths."""
+    files: list[discord.File] = []
+    for path_str in media_paths:
+        path = Path(path_str)
+        if path.is_file():
+            try:
+                files.append(discord.File(path, filename=path.name))
+            except Exception as e:
+                logger.warning(f"Could not attach file {path}: {e}")
+    return files

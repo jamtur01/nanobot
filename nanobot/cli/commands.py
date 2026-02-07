@@ -464,10 +464,11 @@ def channels_status():
     )
 
     dc = config.channels.discord
+    dc_config = f"token: {dc.token[:10]}..." if dc.token else "[dim]not configured[/dim]"
     table.add_row(
         "Discord",
         "✓" if dc.enabled else "✗",
-        dc.gateway_url
+        dc_config
     )
     
     # Telegram
