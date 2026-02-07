@@ -2,10 +2,18 @@
 
 import asyncio
 import json
+import random
+import re
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+# Tool result truncation limit (~3KB)
+MAX_TOOL_RESULT_CHARS = 3000
+
+# Empty LLM response retry config
+EMPTY_RESPONSE_RETRIES = 2
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -158,6 +166,45 @@ class AgentLoop:
                 f"Install with: pip install nanobot-ai[google]  ({e})"
             )
 
+    @staticmethod
+    def _truncate_tool_result(result: str) -> str:
+        """Truncate a single tool result to keep context lean.
+
+        Strips ANSI escape codes, then applies format-aware truncation:
+        - JSON is pretty-printed and prefix-truncated so visible output is valid syntax.
+        - Plain text uses head truncation with a clear sentinel.
+        """
+        # Strip ANSI escape sequences
+        clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', result)
+
+        if len(clean) <= MAX_TOOL_RESULT_CHARS:
+            return clean
+
+        # Detect JSON and handle without breaking syntax
+        stripped = clean.lstrip()
+        if stripped and stripped[0] in ('{', '['):
+            try:
+                parsed = json.loads(clean)
+                pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
+                if len(pretty) <= MAX_TOOL_RESULT_CHARS:
+                    return pretty
+                budget = MAX_TOOL_RESULT_CHARS - 120
+                return (
+                    pretty[:budget]
+                    + f"\n\n... [JSON truncated - showed {budget} of {len(pretty)} chars. "
+                    + "Do NOT re-run this tool to see more.]"
+                )
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Plain text: head truncation with sentinel
+        budget = MAX_TOOL_RESULT_CHARS - 100
+        return (
+            clean[:budget]
+            + f"\n\n... [truncated - showed {budget} of {len(clean)} chars. "
+            + "Do NOT re-run this tool to see more.]"
+        )
+
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
@@ -247,6 +294,7 @@ class AgentLoop:
         # Agent loop
         iteration = 0
         final_content = None
+        empty_retries_left = EMPTY_RESPONSE_RETRIES
         
         while iteration < self.max_iterations:
             iteration += 1
@@ -273,20 +321,38 @@ class AgentLoop:
                     for tc in response.tool_calls
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
+                    messages,
+                    response.content,
+                    tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
                 )
                 
-                # Execute tools
+                # Execute tools (truncate results to keep context lean)
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    raw_result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result = self._truncate_tool_result(raw_result)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
-            else:
+            elif response.content:
                 # No tool calls, we're done
                 final_content = response.content
+                break
+            else:
+                # LLM returned empty: retry with exponential backoff + jitter
+                if empty_retries_left > 0:
+                    empty_retries_left -= 1
+                    retry_num = EMPTY_RESPONSE_RETRIES - empty_retries_left
+                    delay = min(2 ** retry_num + random.uniform(0, 1), 10.0)
+                    logger.warning(
+                        f"LLM returned empty on iteration {iteration}, "
+                        f"retries left: {empty_retries_left}, backing off {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning("LLM returned empty, no retries left - giving up")
                 break
         
         if final_content is None:
@@ -436,6 +502,7 @@ class AgentLoop:
         # Agent loop (limited for announce handling)
         iteration = 0
         final_content = None
+        empty_retries_left = EMPTY_RESPONSE_RETRIES
         
         while iteration < self.max_iterations:
             iteration += 1
@@ -459,18 +526,36 @@ class AgentLoop:
                     for tc in response.tool_calls
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
+                    messages,
+                    response.content,
+                    tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
                 )
                 
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    raw_result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result = self._truncate_tool_result(raw_result)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
-            else:
+            elif response.content:
                 final_content = response.content
+                break
+            else:
+                # Exponential backoff + jitter on empty response
+                if empty_retries_left > 0:
+                    empty_retries_left -= 1
+                    retry_num = EMPTY_RESPONSE_RETRIES - empty_retries_left
+                    delay = min(2 ** retry_num + random.uniform(0, 1), 10.0)
+                    logger.warning(
+                        f"LLM returned empty on iteration {iteration} (system), "
+                        f"retries left: {empty_retries_left}, backing off {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning("LLM returned empty (system), no retries left - giving up")
                 break
         
         if final_content is None:
